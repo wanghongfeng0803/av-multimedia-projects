@@ -1,0 +1,88 @@
+{
+  "results": [
+    {
+      "input_file": "test_input\\01_quiet.wav",
+      "output_file": "test_output\\01_quiet.wav",
+      "status": "success",
+      "input": {
+        "duration_s": 10.0,
+        "sample_rate": 48000,
+        "channels": 1,
+        "lufs": -60.73,
+        "lra": 1.0,
+        "true_peak_db": -59.9
+      },
+      "output": {
+        "lufs": -23.0,
+        "lra": 1.0,
+        "true_peak_db": -22.17,
+        "applied_gain_db": 37.73,
+        "limiter_max_reduction_db": 0.0
+      },
+      "attempts": 1
+    },
+    {
+      "input_file": "test_input\\02_loud.wav",
+      "output_file": "test_output\\02_loud.wav",
+      "status": "success",
+      "input": {
+        "duration_s": 10.0,
+        "sample_rate": 48000,
+        "channels": 1,
+        "lufs": -2.66,
+        "lra": 1.0,
+        "true_peak_db": -1.93
+      },
+      "output": {
+        "lufs": -23.0,
+        "lra": 1.0,
+        "true_peak_db": -22.27,
+        "applied_gain_db": -20.34,
+        "limiter_max_reduction_db": 0.0
+      },
+      "attempts": 1
+    },
+    {
+      "input_file": "test_input\\03_peaky.wav",
+      "output_file": "test_output\\03_peaky.wav",
+      "status": "success",
+      "input": {
+        "duration_s": 5.0,
+        "sample_rate": 48000,
+        "channels": 1,
+        "lufs": -11.15,
+        "lra": 2.17,
+        "true_peak_db": 1.24
+      },
+      "output": {
+        "lufs": -23.0,
+        "lra": 2.17,
+        "true_peak_db": -10.6,
+        "applied_gain_db": -11.85,
+        "limiter_max_reduction_db": 0.0
+      },
+      "attempts": 1
+    },
+    {
+      "input_file": "test_input\\04_stereo.wav",
+      "output_file": "test_output\\04_stereo.wav",
+      "status": "success",
+      "input": {
+        "duration_s": 8.0,
+        "sample_rate": 48000,
+        "channels": 2,
+        "lufs": -5.59,
+        "lra": 1.41,
+        "true_peak_db": -2.01
+      },
+      "output": {
+        "lufs": -23.0,
+        "lra": 1.41,
+        "true_peak_db": -19.42,
+        "applied_gain_db": -17.41,
+        "limiter_max_reduction_db": 0.0
+      },
+      "attempts": 1
+    }
+  ]
+}

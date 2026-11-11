@@ -1,0 +1,25 @@
+{
+  "results": [
+    {
+      "input_file": "demo_input\\sample_program.wav",
+      "output_file": "demo_output\\sample_program.wav",
+      "status": "success",
+      "input": {
+        "duration_s": 60.0,
+        "sample_rate": 48000,
+        "channels": 2,
+        "lufs": -6.05,
+        "lra": 24.28,
+        "true_peak_db": 1.09
+      },
+      "output": {
+        "lufs": -23.0,
+        "lra": 24.28,
+        "true_peak_db": -15.85,
+        "applied_gain_db": -16.95,
+        "limiter_max_reduction_db": 0.0
+      },
+      "attempts": 1
+    }
+  ]
+}

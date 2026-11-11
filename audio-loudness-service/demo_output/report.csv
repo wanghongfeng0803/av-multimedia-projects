@@ -1,0 +1,2 @@
+﻿input_file,output_file,status,in_duration_s,in_sample_rate,in_channels,in_lufs,in_lra,in_true_peak_db,out_lufs,out_lra,out_true_peak_db,applied_gain_db,limiter_max_reduction_db,attempts,warning,error
+demo_input\sample_program.wav,demo_output\sample_program.wav,success,60.0,48000,2,-6.05,24.28,1.09,-23.0,24.28,-15.85,-16.95,0.0,1,,

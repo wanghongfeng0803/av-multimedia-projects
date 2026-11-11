@@ -1,0 +1,5 @@
+﻿input_file,output_file,status,in_duration_s,in_sample_rate,in_channels,in_lufs,in_lra,in_true_peak_db,out_lufs,out_lra,out_true_peak_db,applied_gain_db,limiter_max_reduction_db,attempts,warning,error
+test_input\01_quiet.wav,test_output\01_quiet.wav,success,10.0,48000,1,-60.73,1.0,-59.9,-23.0,1.0,-22.17,37.73,0.0,1,,
+test_input\02_loud.wav,test_output\02_loud.wav,success,10.0,48000,1,-2.66,1.0,-1.93,-23.0,1.0,-22.27,-20.34,0.0,1,,
+test_input\03_peaky.wav,test_output\03_peaky.wav,success,5.0,48000,1,-11.15,2.17,1.24,-23.0,2.17,-10.6,-11.85,0.0,1,,
+test_input\04_stereo.wav,test_output\04_stereo.wav,success,8.0,48000,2,-5.59,1.41,-2.01,-23.0,1.41,-19.42,-17.41,0.0,1,,
