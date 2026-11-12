@@ -1,0 +1,6 @@
+# 端到端测试产物（造源 + 打包输出）
+tests/work/
+
+# Python
+__pycache__/
+*.pyc
