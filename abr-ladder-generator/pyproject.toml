@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abr-ladder"
+version = "1.0.0"
+description = "ABR ladder generator with aligned keyframes and VMAF/SSIM reporting"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+abr-ladder = "abr_ladder.cli:main"
+abr-ladder-verify = "abr_ladder.verify:main"
+
+[tool.setuptools]
+packages = ["abr_ladder"]
