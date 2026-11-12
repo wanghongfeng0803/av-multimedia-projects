@@ -1,0 +1,2 @@
+# 运行时仅依赖 NumPy；视频解码/音频抽取由系统 ffmpeg 提供（需 ffmpeg/ffprobe 在 PATH）
+numpy>=1.24
