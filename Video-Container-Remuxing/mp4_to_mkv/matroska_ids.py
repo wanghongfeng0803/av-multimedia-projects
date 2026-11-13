@@ -1,0 +1,76 @@
+"""Matroska / WebM 规范中的 EBML Element ID 与编码标识常量。
+
+ID 数值本身包含 EBML VINT 长度标记（见 ebml.encode_element_id）。
+仅列出基础版本实际用到的元素，完整列表见 Matroska 规范：
+https://github.com/ietf-wg-cellar/matroska-specification
+"""
+
+from __future__ import annotations
+
+# ---- EBML 文档头 ----
+EBML_HEADER = 0x1A45DFA3
+EBML_VERSION = 0x4286
+EBML_READ_VERSION = 0x42F7
+EBML_MAX_ID_LENGTH = 0x42F2
+EBML_MAX_SIZE_LENGTH = 0x42F3
+DOC_TYPE = 0x4282
+DOC_TYPE_VERSION = 0x4287
+DOC_TYPE_READ_VERSION = 0x4285
+
+# ---- Segment 及其一级子元素 ----
+SEGMENT = 0x18538067
+SEEK_HEAD = 0x114D9B74
+INFO = 0x1549A966
+TRACKS = 0x1654AE6B
+CLUSTER = 0x1F43B675
+
+# ---- Info ----
+TIMESTAMP_SCALE = 0x2AD7B1
+DURATION = 0x4489
+MUXING_APP = 0x4D80
+WRITING_APP = 0x5741
+
+# ---- Tracks / TrackEntry ----
+TRACK_ENTRY = 0xAE
+TRACK_NUMBER = 0xD7
+TRACK_UID = 0x73C5
+TRACK_TYPE = 0x83
+FLAG_DEFAULT = 0x88
+FLAG_LACING = 0x9C
+MIN_CACHE = 0x6DE7
+DEFAULT_DURATION = 0x23E383
+NAME = 0x536E
+CODEC_ID = 0x86
+CODEC_PRIVATE = 0x63A2
+CODEC_DELAY = 0x56AA       # 编解码器前导延迟（ns），用于 AAC priming
+SEEK_PRE_ROLL = 0x56BB    # 随机访问时需回退的时长（ns），AAC 取 80ms
+LANGUAGE = 0x22B59C
+# 视频
+VIDEO = 0xE0
+PIXEL_WIDTH = 0xB0
+PIXEL_HEIGHT = 0xBA
+# 音频
+AUDIO = 0xE1
+SAMPLING_FREQUENCY = 0xB5
+CHANNELS = 0x9F
+BIT_DEPTH = 0x6264
+
+# ---- Cluster ----
+TIMESTAMP = 0xE7
+SIMPLE_BLOCK = 0xA3
+BLOCK_GROUP = 0xA0
+BLOCK = 0xA1
+BLOCK_DURATION = 0x9B
+DISCARD_PADDING = 0x75A2
+
+# TrackType 取值
+TRACK_TYPE_VIDEO = 1
+TRACK_TYPE_AUDIO = 2
+
+# Matroska 编码标识（CodecID）
+CODEC_ID_AVC1 = "V_MPEG4/ISO/AVC"   # H.264 / AVC
+CODEC_ID_HEVC = "V_MPEGH/ISO/HEVC"  # H.265 / HEVC
+CODEC_ID_AAC = "A_AAC"              # AAC（私有数据为 AudioSpecificConfig）
+
+# TimestampScale 的默认值：1 个时间戳单位 = 1,000,000 纳秒 = 1 毫秒
+DEFAULT_TIMESTAMP_SCALE = 1_000_000
