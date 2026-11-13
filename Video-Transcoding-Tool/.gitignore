@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 工具产物
+*.ffmpeg.log
+demo/*.mp4
