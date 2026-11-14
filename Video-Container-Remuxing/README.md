@@ -90,6 +90,39 @@ $ python -m mp4_to_mkv missing.mp4 out.mkv
 错误：输入文件不存在: missing.mp4
 ```
 
+#### 批量重封装
+
+批量入口在单文件重试管线之上做「发现 → 规划 → 逐项隔离执行」，
+可一次处理文件与目录混排的一批输入：
+
+```bash
+python batch_remux.py OUT_DIR INPUT [INPUT ...] [--recursive/--no-recursive]
+                       [--on-existing {rename,overwrite,skip}]
+                       [--dry-run] [--stop-on-error]
+                       [--retries N] [--retry-delay SECONDS]
+# --overwrite / --skip-existing 是 --on-existing 的快捷写法（三者互斥）
+```
+
+- **输入发现**：目录默认递归扫描，只收 `.mp4/.m4v/.mov/.m4a` 普通文件，
+  显式给出的文件不做后缀限制；按解析后的绝对路径去重，处理顺序确定可复现。
+- **输出碰撞**：所有输出平铺到 `OUT_DIR`，默认 `rename` 策略把同名文件
+  自动改名为 `stem_2.mkv`、`stem_3.mkv`……（非破坏，绝不覆盖已有文件）；
+  `overwrite` 走单文件管线的原子替换覆盖；`skip` 跳过已存在的输出。
+- **故障隔离**：单个文件失败（不支持的结构、重试用尽等）只记录该项的
+  中文原因，其余文件照常处理；`--stop-on-error` 可切换为遇错即停。
+- `--dry-run` 只打印发现结果与输出规划，不创建目录、不执行转换。
+- 退出码：`0` 全部成功（含全跳过/空批），`2` 整批前置错误（如输入不存在），
+  `5` 批中至少一项失败。
+
+示例（两个不同目录下的同名 `song.mp4` 自动分流为两个输出）：
+
+```
+$ python batch_remux.py mkv_out album
+[成功] album\live\song.mp4 -> mkv_out\song.mkv（尝试 1 次）
+[成功] album\song.mp4 -> mkv_out\song_2.mkv（尝试 1 次）
+汇总：共 2 项，成功 2，失败 0，跳过 0
+```
+
 ### Python API
 
 直接使用底层包：
@@ -118,6 +151,18 @@ except RemuxError:
     ...      # 确定性输入错误，重试无意义
 except RemuxRetryError:
     ...      # 瞬时性错误，重试用尽
+```
+
+批量编排层（逐项结果可程序化检查，单文件失败不会中断整批）：
+
+```python
+from batch_remux import remux_batch
+
+report = remux_batch(["movie.mp4", "dir_in"], "out_dir",
+                     on_existing="rename", dry_run=False)
+for item in report.results:
+    print(item.status, item.source, item.output, item.reason)
+# 汇总属性：report.total / report.succeeded / report.failed / report.skipped
 ```
 
 ## 工作原理
@@ -154,6 +199,7 @@ MKV 字节流
 ## 项目结构
 
 ```
+batch_remux.py          # 批量重封装编排：发现/规划/逐项隔离（CLI + Python API）
 remux_all_tracks.py     # 带失败重试的全轨道重封装编排（CLI + Python API）
 mp4_to_mkv/
 ├── __init__.py
@@ -173,7 +219,7 @@ tests/
 ├── test_remuxer.py         # 端到端结构/无损/CLI
 ├── test_all_tracks.py      # 全轨道（视频/音频/字幕）结构与无损
 ├── test_retry.py           # 失败重试的边界与清理
-└── test_integration_ffmpeg.py  # 真实文件 + framemd5 无损验证
+├── test_batch.py           # 批量发现/规划/故障隔离/CLI（39 个用例）
 └── test_integration_ffmpeg.py  # 真实文件 + framemd5 无损验证
 ```
 
@@ -192,6 +238,7 @@ python -m unittest discover -s tests
 
 | 码 | 含义 |
 | --- | --- |
-| 0 | 成功 |
-| 2 | 输入无效或包含不支持的结构（中文提示） |
-| 3 | 内存不足等非预期错误 |
+| 0 | 成功（批量入口中，全部成功、全跳过或空批均为 0） |
+| 2 | 输入无效或包含不支持的结构（中文提示）；批量入口的整批前置错误同码 |
+| 3 | 单文件入口：重试用尽；`python -m mp4_to_mkv`：内存不足等非预期错误 |
+| 5 | 批量入口：批中至少一项失败（其余项可能已成功） |
