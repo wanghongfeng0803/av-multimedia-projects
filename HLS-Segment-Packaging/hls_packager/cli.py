@@ -183,35 +183,33 @@ def _build_encryption_config(args) -> EncryptionConfig | None:
         return None
     if args.key_file and args.key_text:
         raise EncryptionError("--key-file 与 --key 只能二选一，不能同时提供")
-
-    key_uri = args.key_uri
-    if args.key_file:
-        config = EncryptionConfig.from_key_file(
-            args.key_file, iv=args.iv_text, key_uri=key_uri
-        )
-    elif args.key_text:
-        config = EncryptionConfig.from_key(
-            args.key_text, iv=args.iv_text, key_uri=key_uri
-        )
-    else:
-        # 仅 --encrypt：现场生成密钥；IV 模式由 --iv-mode 决定
-        config = EncryptionConfig.generate(
-            key_uri=key_uri, random_iv=(args.iv_mode == "random")
-        )
-
-    # 显式 --iv 与 --iv-mode sequence 语义冲突，明确报错而不是静默覆盖
+    # 显式 --iv 与序号派生模式语义互斥，明确报错而不是静默覆盖
     if args.iv_text is not None and args.iv_mode == "sequence":
         raise EncryptionError(
             "已显式传入 --iv 时不能再指定 --iv-mode sequence"
             "（序号派生模式要求不提供 IV）"
         )
-    if args.iv_text is None and args.key_file is None and args.key_text is None:
-        # 纯 --encrypt 分支已按 iv_mode 生成，无需后处理
-        return config
-    if args.iv_text is None and args.iv_mode == "sequence" and config.iv is not None:
-        # 理论上 from_key_file/from_key 在无 iv 时 iv 就是 None，这里只做防御
-        return EncryptionConfig(key=config.key, iv=None, key_uri=config.key_uri)
-    return config
+
+    key_uri = args.key_uri
+    if args.key_file:
+        # 未传 --iv 且要求序号模式时，from_key_file 的 iv=None 正好是该语义
+        return EncryptionConfig.from_key_file(
+            args.key_file, iv=args.iv_text, key_uri=key_uri
+        )
+    if args.key_text:
+        return EncryptionConfig.from_key(
+            args.key_text, iv=args.iv_text, key_uri=key_uri
+        )
+    # 仅 --encrypt：现场生成密钥；显式 --iv 优先解析（长度非法会明确报错），
+    # 否则按 --iv-mode 生成随机 IV 或退化为 RFC 序号派生 IV
+    generated_key = EncryptionConfig.generate(
+        key_uri=key_uri, random_iv=(args.iv_mode == "random")
+    )
+    if args.iv_text is not None:
+        return EncryptionConfig.from_key(
+            generated_key.key, iv=args.iv_text, key_uri=key_uri
+        )
+    return generated_key
 
 
 def _print_summary(result) -> None:
@@ -236,6 +234,16 @@ def _print_summary(result) -> None:
     )
     if result.extra.get("watermark_png"):
         print(f"  文字水印   : {result.extra['watermark_png']}")
+    encryption_info = result.extra.get("encryption")
+    if encryption_info:
+        print("  AES-128 加密: 已启用（AES-128-CBC + PKCS#7）")
+        print(f"    密钥文件 : {encryption_info['key_file']}")
+        print(f"    密钥 URI : {encryption_info['key_uri']}")
+        print(f"    密钥(hex): {encryption_info['key_hex']}")
+        if encryption_info["iv_mode"] == "explicit":
+            print(f"    IV(hex) : {encryption_info['iv_hex']}")
+        else:
+            print("    IV 策略 : 按分片 MEDIA-SEQUENCE 序号大端派生（RFC §5.2）")
     print("  分片明细（前 5 片）:")
     for seg in segments[:5]:
         print(
@@ -263,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                 margin_x=args.watermark_margin_x,
                 margin_y=args.watermark_margin_y,
             )
+        encryption = _build_encryption_config(args)
         result = package(
             input_path=args.input,
             output_dir=args.output_dir,
@@ -272,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
             filename_prefix=args.filename_prefix,
             overwrite=args.overwrite,
             watermark=watermark,
+            encryption=encryption,
         )
     except PackagerError as exc:
         # 可预期的输入/环境/切片问题：明确中文提示 + 非零退出码

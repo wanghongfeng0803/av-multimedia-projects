@@ -25,6 +25,11 @@
   依赖；自带 5x7 点阵字体作为字体全部缺失时的最终回退。叠加走
   `overlay` 过滤器，参数全部以独立 argv 传递、路径不进 filtergraph，
   杜绝注入；不指定水印时行为与纯流拷贝版本完全一致。
+- **AES-128 分片加密（可选，RFC 8216）**：纯标准库从零实现 AES-128 块密码
+  （FIPS-197）、CBC 模式（SP 800-38A）与 PKCS#7 填充，通过 NIST 已知答案
+  向量与 openssl 字节级交叉验证；按规范输出 `EXT-X-KEY`（METHOD/URI/IV），
+  支持随机 IV 与 RFC §5.2 序号派生 IV；密钥/IV/URI 异常均有明确中文报错，
+  不启用时与旧版本逐字节等价。
 - **零第三方 Python 依赖**：仅用标准库，外部只依赖系统 `ffmpeg`/`ffprobe`。
 
 ## 目录结构
@@ -41,20 +46,25 @@ hls_packager/
 ├── probe.py         # ffprobe 探测 + 关键帧时间序列提取
 ├── planner.py       # GOP 对齐分片规划（纯函数，无 IO）
 ├── ts_writer.py     # segment muxer 一次成型切片 + 逐片复测（含水印分支）
-├── m3u8.py          # M3U8 渲染与合规校验（纯函数）
-├── packager.py      # 编排层：probe → plan → 切片 → 复测 → 播放列表
-└── watermark/       # 文字水印：自研栅格化 + 安全叠加（仅依赖标准库）
-    ├── utf8.py          # 手写 UTF-8 解码器（拒绝过长/代理/截断/越界）
-    ├── bitmap_font.py   # 内置 5x7 点阵字体（零依赖最终回退）
-    ├── ttf_font.py      # 自研 TrueType/TTC 解析（cmap/glyf/hmtx/loca...）
-    ├── rasterizer.py    # 扫描线 + 4x 超采样抗锯齿字形栅格化
-    ├── font_stack.py    # 字体发现与按码点回退链（显式→系统→点阵→豆腐块）
-    ├── rasterize.py     # 排版绘制：码点序列 → RGBA 位图 → PNG
-    ├── png_buf.py       # RGBA 位图与自研 PNG 编码
-    ├── escaping.py      # 过滤器路径转义 + shell/argv 引号包裹（防注入）
-    ├── overlay.py       # 九宫格定位 + ffmpeg overlay segment 命令构造
-    └── config.py        # WatermarkConfig 不可变配置与校验
-tests/               # pytest：纯逻辑单测 + ffmpeg 集成测试（含 72 个水印用例）
+├── m3u8.py          # M3U8 渲染与合规校验（纯函数，含 EXT-X-KEY）
+├── packager.py      # 编排层：probe → plan → 切片 → 复测 → 加密 → 播放列表
+├── watermark/       # 文字水印：自研栅格化 + 安全叠加（仅依赖标准库）
+│   ├── utf8.py          # 手写 UTF-8 解码器（拒绝过长/代理/截断/越界）
+│   ├── bitmap_font.py   # 内置 5x7 点阵字体（零依赖最终回退）
+│   ├── ttf_font.py      # 自研 TrueType/TTC 解析（cmap/glyf/hmtx/loca...）
+│   ├── rasterizer.py    # 扫描线 + 4x 超采样抗锯齿字形栅格化
+│   ├── font_stack.py    # 字体发现与按码点回退链（显式→系统→点阵→豆腐块）
+│   ├── rasterize.py     # 排版绘制：码点序列 → RGBA 位图 → PNG
+│   ├── png_buf.py       # RGBA 位图与自研 PNG 编码
+│   ├── escaping.py      # 过滤器路径转义 + shell/argv 引号包裹（防注入）
+│   ├── overlay.py       # 九宫格定位 + ffmpeg overlay segment 命令构造
+│   └── config.py        # WatermarkConfig 不可变配置与校验
+└── encryption/      # AES-128 分片加密（RFC 8216，纯标准库从零实现）
+    ├── aes_cbc.py       # AES-128（FIPS-197）+ CBC（SP 800-38A）+ PKCS#7
+    ├── config.py        # 密钥/IV/URI 解析校验、EncryptionConfig、序号 IV 派生
+    ├── key_info.py      # EXT-X-KEY 描述模型与标签行渲染
+    └── segment_io.py    # 分片流式加密 + 原子替换、密钥文件落盘
+tests/               # pytest：纯逻辑单测 + ffmpeg/openssl 集成测试
 ```
 
 数据单向流动，模块之间只通过 `models.py` 里的不可变 dataclass 通信：
@@ -72,8 +82,10 @@ MediaInfo
 [WrittenSegment 实测时长]
   │  _rebuild_timeline()  用实测时长重建连续时间轴
   ▼
-[SegmentInfo 终态] ──► render_playlist() ──► playlist.m3u8
-                   └► _write_metadata() ──► segments.json
+[SegmentInfo 终态] ──► (可选) encrypt_segment_file() 逐片 AES-128-CBC
+  │                                              + write_key_file() 裸密钥
+  ├──────────────► render_playlist() ──► playlist.m3u8（含/不含 EXT-X-KEY）
+  └──────────────► _write_metadata() ──► segments.json
 ```
 
 ## 核心设计与正确性保证
@@ -116,6 +128,39 @@ hls muxer 或其自带播放列表。
 - 分片序号必须连续；直播窗口的 `MEDIA-SEQUENCE` 与窗口首片严格对齐；
 - `EXTINF` 统一 3 位小数浮点秒；VOD 列表带 `ENDLIST`，直播列表不带。
 
+### 5. AES-128 分片加密（`encryption/`，RFC 8216 §4.3.2.4 / §5.2）
+
+加密是切片之后的可选旁路，与切片、水印完全解耦：
+
+```
+明文 TS 分片（复测通过）
+  │  encrypt_segment_file()   64 KiB 流式 CBC 加密 → 临时文件 → os.replace 原子替换
+  ▼
+密文 TS 分片（长度向上取整到 16 字节倍数）+ encryption.key（16 字节裸密钥）
+  │  render_key_tag()         EXT-X-KEY 写入首个 EXTINF 之前
+  ▼
+带 EXT-X-KEY 的 playlist.m3u8
+```
+
+- **算法正确性**：AES-128 块密码严格按 FIPS-197 实现（S 盒由 GF(2^8)
+  乘法逆元 + 仿射变换程序化生成，避免手抄常量表出错）；CBC 链式加密按
+  NIST SP 800-38A；非块对齐数据按 PKCS#7（RFC 5652）补齐，去填充时
+  严格校验填充值与填充区一致性，密文损坏/密钥不匹配会明确报错。
+  测试内置 FIPS-197 附录 B、SP 800-38A 官方向量，并在装有 openssl 时
+  做 9 组随机长度的双向字节级交叉验证。
+- **IV 处理**：默认随机生成 16 字节显式 IV 并写入 `EXT-X-KEY` 的
+  `IV=0x...`；也支持 RFC §5.2 的隐式序号 IV——IV 为分片
+  MEDIA-SEQUENCE 的 128 位大端表示，此时播放列表省略 `IV` 属性，
+  与非零 `--media-sequence` 组合时按绝对序号派生。
+- **容错边界**：密钥/IV 接受原始字节、32 位 hex、Base64 与密钥文件
+  四种来源，长度或格式非法、URI 含引号/控制字符/非 ASCII、密钥文件
+  缺失或为空，全部以中文 `EncryptionError`（`PackagerError` 子类）
+  抛出，CLI 统一走退出码 2。
+- **失败安全**：加密先写同目录 `.enc.tmp` 临时文件，全部密文 fsync 后
+  才 `os.replace` 原子覆盖；中途 IO 失败会清理临时文件，原明文分片不动。
+- **不启用即等价**：`encryption=None` 时该旁路完全不执行，播放列表
+  无 `EXT-X-KEY`、分片首字节仍是 TS 同步字节 `0x47`，由回归测试锁定。
+
 ## 安装与环境
 
 需要系统提供 `ffmpeg` 与 `ffprobe`（建议 4.4+）。可执行文件查找顺序：
@@ -155,6 +200,19 @@ python -m hls_packager input.mp4 output_dir/ -d 6 -y \
 python -m hls_packager input.mp4 output_dir/ -y \
   --watermark-text "机密" --watermark-font C:/Windows/Fonts/msyh.ttc \
   --watermark-anchor top-left --watermark-margin-x 16 --watermark-margin-y 16
+
+# 启用 AES-128 加密：自动生成随机密钥与随机 IV，密钥写入输出目录
+python -m hls_packager input.mp4 output_dir/ -d 6 -y --encrypt
+
+# 使用已有密钥（32 位 hex 或 Base64）与显式 IV
+python -m hls_packager input.mp4 output_dir/ -y \
+  --key 2b7e151628aed2a6abf7158809cf4f3c --iv 000102030405060708090a0b0c0d0e0f
+
+# 从密钥文件读取（16 字节原始二进制，或 hex/Base64 文本），
+# IV 改为 RFC §5.2 序号派生（播放列表不写 IV），URI 指向 CDN
+python -m hls_packager input.mp4 output_dir/ -y \
+  --key-file secret.key --iv-mode sequence \
+  --key-uri https://cdn.example.com/keys/encryption.key
 ```
 
 参数一览：
@@ -175,6 +233,12 @@ python -m hls_packager input.mp4 output_dir/ -y \
 | `--watermark-opacity` | 不透明度 0.0~1.0 | 1.0 |
 | `--watermark-anchor` | 九宫格锚点（如 `top-left`/`center`/`bottom-right`） | bottom-right |
 | `--watermark-margin-x/y` | 水印距画面边缘的像素留白 | 24 / 24 |
+| `--encrypt` | 启用 AES-128 加密；未给密钥时自动生成随机密钥+IV | 关 |
+| `--key-file` | 密钥文件（16 字节原始二进制，或 hex/Base64 文本），隐含启用加密 | 无 |
+| `--key` | 直接传密钥：32 位 hex 或 Base64（解码后 16 字节） | 无 |
+| `--key-uri` | EXT-X-KEY 的 URI（相对文件名或 https 绝对地址） | encryption.key |
+| `--iv` | 显式 IV：32 位 hex（可带 `0x`）或 Base64 | 随机生成 |
+| `--iv-mode` | 无显式 IV 时：`random`（随机显式 IV）/ `sequence`（序号派生） | random |
 
 退出码：`0` 成功；`2` 可预期的输入/环境/切片错误；`3` 未知内部错误。
 
@@ -212,6 +276,15 @@ wm = WatermarkConfig(
 )
 result = package("input.mp4", "out/", target_duration=6.0, watermark=wm, overwrite=True)
 
+# 带 AES-128 加密的打包（encryption=None 时与旧版本行为完全一致）
+from hls_packager import EncryptionConfig
+
+enc = EncryptionConfig.generate()                 # 随机密钥 + 随机显式 IV
+# enc = EncryptionConfig.from_key_file("secret.key", iv=None)  # 序号派生 IV
+result = package("input.mp4", "out/", target_duration=6.0,
+                 encryption=enc, overwrite=True)
+print(result.extra["encryption"])  # key_file / key_uri / key_hex / iv_mode / iv_hex
+
 # 也可单独使用纯函数模块
 planned = plan_segments(duration=30.0, target_duration=4.0,
                         keyframe_times=(0.0, 2.0, 4.0, ...))
@@ -226,11 +299,12 @@ print(rendered.width, rendered.height, rendered.used_fallbacks)
 
 ```
 output_dir/
-├── playlist.m3u8     # 播放列表
-├── seg_0000.ts       # MPEG-TS 分片（188 字节定长包，同步字节 0x47，自带 PAT/PMT）
+├── playlist.m3u8     # 播放列表（加密时含 EXT-X-KEY:METHOD=AES-128,URI=...,IV=...）
+├── encryption.key    # AES-128 裸密钥（16 字节；仅启用加密时生成）
+├── seg_0000.ts       # MPEG-TS 分片（188 字节定长包；加密后为 16 字节对齐密文）
 ├── seg_0001.ts
 ├── ...
-└── segments.json     # 机器可读元数据（源内起点 / 时间轴起点 / 实测时长 / 序号）
+└── segments.json     # 机器可读元数据（源内起点 / 时间轴起点 / 实测时长 / 加密信息）
 ```
 
 ## 支持的编码
@@ -251,6 +325,13 @@ pytest
 
 - `tests/test_planner.py`、`test_m3u8.py`、`test_probe.py`、
   `test_ts_writer.py`：纯逻辑单测，不依赖 ffmpeg；
+- `tests/test_encryption_aes.py`、`test_encryption_config.py`、
+  `test_encryption_segment_io.py`：加密纯逻辑单测——FIPS-197 / SP 800-38A
+  官方向量、PKCS#7 畸形填充、密钥/IV/URI 容错、流式分块等价、原子替换
+  失败回滚；装有 openssl 时自动追加字节级交叉验证；
+- `tests/test_encryption_integration.py`：真实 ffmpeg 切片后加密，
+  openssl 解密回明文 TS 并由 ffprobe 复测时长、EXT-X-KEY 合规、
+  序号 IV、滑动窗口/非零 MEDIA-SEQUENCE 组合、CLI 退出码与旧路径回归；
 - `tests/test_watermark_*.py`：水印单测（UTF-8 异常输入、字体回退、
   转义注入、PNG 渲染）+ ffmpeg 集成测试（首帧 IDR、水印可见、
   特殊字符路径、时间戳连续、CLI 端到端）；
@@ -273,3 +354,9 @@ pytest
   实时打包循环的构建块。
 - 切点数量极多导致命令行超长时会明确报错并提示增大分片时长
   （Windows 命令行长度上限保护）。
+- RFC 8216 的 `METHOD=AES-128` 只提供机密性、不提供完整性校验（CBC 无
+  MAC）；本工具的去填充校验能发现意外损坏，但不能防御主动篡改，这是
+  协议方法本身的属性。需要完整性应升级到 `SAMPLE-AES` 或配合 HTTPS
+  分发与外部签名机制。
+- 加密密钥以 16 字节裸文件写入输出目录，生产环境应通过 `--key-uri`
+  指向独立的鉴权密钥服务，不要把密钥与播放列表放在同一公开路径下。
