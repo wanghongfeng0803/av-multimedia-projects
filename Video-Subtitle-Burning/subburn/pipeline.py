@@ -25,19 +25,21 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
 from .fonts import Font, load_font, resolve_font
 from .render import OverlayRenderer, Style
-from .ass import ASSDocument
+from .ass import ASSDocument, parse_ass_file
 from .ass_render import ASSRenderer
-from .srt import Cue
+from .srt import Cue, parse_srt_file
 from .style import SubtitleStyle
 from .timeline import FrameTimeline, SubtitleScheduler, frame_time_ms
+from .tracks import extract_track, probe_subtitle_tracks, select_track
 
-__all__ = ["BurnResult", "probe_video", "burn_subtitles", "burn_ass"]
+__all__ = ["BurnResult", "probe_video", "burn_subtitles", "burn_ass",
+           "burn_track"]
 
 #: 逐帧渲染回调：拿到 RGB24 帧缓冲与帧坐标，就地把字幕画进去。
 #: SRT 与 ASS 两条流水线共用同一个 ffmpeg 泵，差别只在这个回调。
@@ -58,6 +60,8 @@ class BurnResult:
     cues: int
     encoder: str
     had_audio: bool
+    #: 内嵌多轨烧录（burn_track）时记录所选轨摘要；文件字幕路径恒为 ""
+    track: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +273,70 @@ def burn_ass(
         encoder="libx264",
         had_audio=audio_path is not None,
     )
+
+
+def burn_track(
+    input_path: str,
+    output_path: str,
+    *,
+    stream_index: int | None = None,
+    sub_index: int | None = None,
+    language: str | None = None,
+    title: str | None = None,
+    font: Font | None = None,
+    style: Style | SubtitleStyle | None = None,
+    strict: bool = False,
+    crf: int = 23,
+    preset: str = "medium",
+    overwrite: bool = False,
+    progress_callback: ProgressCallback | None = None,
+) -> BurnResult:
+    """从多轨容器中选定一条内嵌字幕轨并烧录，返回执行结果摘要。
+
+    选择流程三步走（每步的异常类型见 :mod:`subburn.tracks`）::
+
+        probe_subtitle_tracks  枚举全部字幕轨（ffprobe）
+        select_track           按流索引/轨序号/语言/标题定位唯一目标轨
+        extract_track          把目标轨解出为临时 SRT/ASS 文件
+
+    之后按格式分派到既有的 :func:`burn_subtitles` / :func:`burn_ass`，
+    渲染、调度、编码路径与文件字幕完全一致，已有行为不受影响。
+
+    :param stream_index: 容器内绝对流索引（ffprobe 的 index）
+    :param sub_index: 字幕轨内相对序号（第几条字幕轨，0 起）
+    :param language: 语言标签（大小写不敏感，如 ``chi``/``eng``）
+    :param title: 轨标题（大小写不敏感的精确匹配）
+    :param strict: 解析抽出的字幕文件时是否遇错即抛
+    """
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(input_path)
+    if os.path.exists(output_path) and not overwrite:
+        raise FileExistsError(f"输出已存在（需 overwrite=True）: {output_path}")
+
+    tracks = probe_subtitle_tracks(input_path)
+    track = select_track(
+        tracks,
+        stream_index=stream_index, sub_index=sub_index,
+        language=language, title=title,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="subburn_track_") as tmpdir:
+        sub_file = extract_track(input_path, track, tmpdir)
+        if track.format == "ass":
+            document, _warnings = parse_ass_file(sub_file, strict=strict)
+            result = burn_ass(
+                input_path, output_path, document,
+                crf=crf, preset=preset, overwrite=True,
+                progress_callback=progress_callback,
+            )
+        else:
+            cues, _warnings = parse_srt_file(sub_file, strict=strict)
+            result = burn_subtitles(
+                input_path, output_path, cues,
+                font=font, style=style, crf=crf, preset=preset,
+                overwrite=True, progress_callback=progress_callback,
+            )
+    return replace(result, track=track.describe())
 
 
 def _pump_frames(

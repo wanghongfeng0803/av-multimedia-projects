@@ -21,7 +21,7 @@ from .fonts import (
     load_font,
     resolve_font,
 )
-from .pipeline import BurnResult, burn_ass, burn_subtitles, probe_video
+from .pipeline import BurnResult, burn_ass, burn_subtitles, burn_track, probe_video
 from .render import OverlayRenderer, Style, blend_rgba_tile
 from .srt import Cue, SRTParseError, parse_srt, parse_srt_file, parse_timecode
 from .style import (
@@ -35,6 +35,18 @@ from .style import (
     VAlign,
 )
 from .timeline import FrameTimeline, SubtitleScheduler, frame_time_ms
+from .tracks import (
+    SubtitleTrack,
+    TrackAmbiguousError,
+    TrackError,
+    TrackNotFoundError,
+    TrackProbeError,
+    TrackSelectionError,
+    extract_track,
+    parse_tracks,
+    probe_subtitle_tracks,
+    select_track,
+)
 
 __all__ = [
     # SRT
@@ -54,7 +66,11 @@ __all__ = [
     "Color", "FontSpec", "FontWeight", "HAlign", "VAlign",
     "Margins", "Position", "SubtitleStyle",
     # 管道
-    "BurnResult", "burn_subtitles", "burn_ass", "probe_video",
+    "BurnResult", "burn_subtitles", "burn_ass", "burn_track", "probe_video",
+    # 内嵌多轨选择
+    "SubtitleTrack", "TrackError", "TrackProbeError", "TrackSelectionError",
+    "TrackNotFoundError", "TrackAmbiguousError",
+    "parse_tracks", "probe_subtitle_tracks", "select_track", "extract_track",
 ]
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

@@ -140,6 +140,29 @@ ASS 与 SRT 的根本区别是「样式集中声明 + 行内覆盖标签」：`[
 逐帧泵，两种格式的差异只封装在各自的帧回调（`OverlayRenderer` vs
 `ASSRenderer`）里，进程管理与读写循环只有一份实现。
 
+### 5. 内嵌多字幕轨选择（`subburn/tracks.py`）
+
+MKV/MP4 容器可内嵌多条字幕轨，本模块负责「烧录哪一条」的选择流程，
+分三层、各自可独立单测：
+
+```
+ffprobe JSON ──► parse_tracks()    纯函数：流元数据 → SubtitleTrack 索引表
+轨道表 ──► select_track()          纯函数：按流索引/轨序号/语言/标题定位
+目标轨 ──► extract_track()         ffmpeg 解出为临时 SRT/ASS，交既有渲染管线
+```
+
+- **双索引数据结构**：`SubtitleTrack` 同时记录容器内绝对流索引
+  （`stream_index`，`-map 0:N` 用）与字幕轨相对序号（`sub_index`，即
+  ffmpeg 的 `s:N`），并归一化语言标签（小写、`und`/缺失→空串）、
+  标题、default/forced 标志与可烧录格式（subrip/mov_text→SRT，ass/ssa→ASS）；
+- **选择语义**：多个条件取交集；不给条件时「唯一 default 轨 → 唯一轨」，
+  否则报歧义。无字幕轨、条件无匹配、多轨歧义分别抛
+  `TrackNotFoundError`/`TrackAmbiguousError`，异常携带可用轨列表，
+  CLI 直接把诊断呈现给用户；图形字幕轨（PGS 等）枚举照列、选中烧录时
+  才报「不可烧录」；
+- **零侵入复用**：抽出的临时字幕文件走既有 `parse_srt_file`/`parse_ass_file`
+  与 `burn_subtitles`/`burn_ass`，渲染、调度、编码路径与文件字幕完全一致。
+
 ## 环境要求
 
 - Python 3.10+
@@ -158,6 +181,11 @@ python -m subburn burn input.mp4 subs.srt -o out.mp4 --font-size 32 --crf 20
 
 # 严格模式：字幕格式异常直接报错；JSON 摘要；覆盖已有输出
 python -m subburn burn input.mp4 subs.ass --strict --json -y
+
+# 内嵌多轨：先枚举容器里的字幕轨，再按流索引/语言等指定烧录
+python -m subburn tracks input.mkv
+python -m subburn burn-track input.mkv --lang chi -o out.mp4
+python -m subburn burn-track input.mkv --stream 3 --json -y
 ```
 
 ASS 的样式与特效完全由字幕文件内的 `[V4+ Styles]` 与行内标签决定，
@@ -222,12 +250,33 @@ result = burn_ass("input.mp4", "out.mp4", document,
 print(result.cues, len(document.styles))
 ```
 
+内嵌多轨作为库使用（选择条件可组合，交集生效）：
+
+```python
+from subburn import (
+    probe_subtitle_tracks, select_track, burn_track,
+    TrackNotFoundError, TrackAmbiguousError,
+)
+
+tracks = probe_subtitle_tracks("input.mkv")       # SubtitleTrack 索引表
+for t in tracks:
+    print(t.describe())                           # s:0 流2 subrip lang=eng default
+
+try:
+    result = burn_track("input.mkv", "out.mp4", language="chi")
+except TrackNotFoundError as e:
+    print("没有这条轨:", e)                        # 异常自带可用轨列表
+except TrackAmbiguousError as e:
+    print("条件太宽:", e.tracks)                   # 匹配到的轨道集合
+print(result.track)                               # 实际烧录的轨摘要
+```
+
 ## 测试
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest          # 250+ 用例：SRT/ASS 解析、样式系统、字体回退、
-                          # 混合数学、卡拉OK/淡入/定位特效、ffmpeg 端到端
+python -m pytest          # 280+ 用例：SRT/ASS 解析、样式系统、字体回退、
+                          # 混合数学、卡拉OK/淡入/定位特效、多轨选择、ffmpeg 端到端
 python -m doctest subburn/srt.py
 ```
 
@@ -244,7 +293,8 @@ subburn/
   fonts.py      位图字体(含斜体切变) + Pillow TTF + 字体族注册表与回退链
   render.py     SRT 排版、瓦片缓存、RGBA 源覆盖混合
   ass_render.py ASS 排版：多样式 run、numpad 定位、卡拉OK/淡入/\move、底盒
-  pipeline.py   ffprobe 探测、解码/编码双进程逐帧泵、音频直通
+  pipeline.py   ffprobe 探测、解码/编码双进程逐帧泵、音频直通、多轨烧录
+  tracks.py     内嵌字幕轨枚举、元数据归一化、目标轨定位与抽取
   cli.py        命令行入口（格式自动识别，SRT 样式参数 ASS 模式拒绝）
 tests/          单元测试 + ffmpeg 端到端集成测试
 demo/           示例视频、SRT 与 ASS 样例

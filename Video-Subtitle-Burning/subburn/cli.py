@@ -22,9 +22,10 @@ from pathlib import Path
 from . import __version__
 from .ass import ASSParseError, parse_ass
 from .fonts import load_font
-from .pipeline import burn_ass, burn_subtitles
+from .pipeline import burn_ass, burn_subtitles, burn_track
 from .render import Style
 from .srt import parse_srt_file
+from .tracks import TrackError, probe_subtitle_tracks
 from .style import (
     Color,
     FontSpec,
@@ -99,6 +100,33 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="新版样式 JSON 文件（SubtitleStyle 字典）")
     p.add_argument("-y", "--overwrite", action="store_true", help="覆盖已存在的输出")
     p.add_argument("--json", action="store_true", help="以 JSON 输出结果摘要")
+
+    # -- 内嵌多轨：枚举与指定烧录 ----------------------------------------
+    t = sub.add_parser("tracks", help="列出容器内嵌的全部字幕轨")
+    t.add_argument("video", help="输入视频/容器路径")
+    t.add_argument("--json", action="store_true", help="以 JSON 输出轨道列表")
+
+    bt = sub.add_parser("burn-track", help="烧录容器内嵌的指定字幕轨")
+    bt.add_argument("video", help="输入视频/容器路径")
+    bt.add_argument("-o", "--output", help="输出路径（默认 <视频名>_subbed.mp4）")
+    sel = bt.add_argument_group("轨道选择（条件取交集；不给出时用默认轨）")
+    sel.add_argument("--stream", type=int, metavar="N",
+                     help="容器内绝对流索引（ffprobe 的 index）")
+    sel.add_argument("--sub-index", type=int, metavar="N",
+                     help="字幕轨相对序号（第几条字幕轨，0 起）")
+    sel.add_argument("--lang", metavar="TAG",
+                     help="按语言标签选择（如 chi、eng，大小写不敏感）")
+    sel.add_argument("--title", metavar="TEXT",
+                     help="按轨标题选择（大小写不敏感精确匹配）")
+    bt.add_argument("--crf", type=int, default=23, help="x264 CRF 质量（默认 23）")
+    bt.add_argument("--preset", default="medium",
+                    choices=("ultrafast", "superfast", "veryfast", "faster",
+                             "fast", "medium", "slow", "slower", "veryslow"))
+    bt.add_argument("--strict", action="store_true",
+                    help="抽出的字幕格式异常时直接报错而非容忍恢复")
+    bt.add_argument("--json", action="store_true", help="以 JSON 输出结果摘要")
+    bt.add_argument("-y", "--overwrite", action="store_true",
+                    help="覆盖已存在的输出")
     return parser
 
 
@@ -195,6 +223,10 @@ def _is_ass_file(path: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "tracks":
+        return _run_tracks(args)
+    if args.command == "burn-track":
+        return _run_burn_track(args)
     is_ass = _is_ass_file(args.srt)
 
     if is_ass:
@@ -329,6 +361,87 @@ def _run_ass(args: argparse.Namespace) -> int:
               f"({result.width}x{result.height} @ {result.fps:g}fps, "
               f"{result.frames_written} 帧, {result.cues} 条对话, "
               f"{len(document.styles)} 个样式"
+              f"{', 含音频' if result.had_audio else ', 无音频'})")
+    return 0
+
+
+def _run_tracks(args: argparse.Namespace) -> int:
+    """``tracks`` 子命令：枚举容器内嵌字幕轨，人读表格或 JSON。"""
+    try:
+        tracks = probe_subtitle_tracks(args.video)
+    except (FileNotFoundError, TrackError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({
+            "input": args.video,
+            "tracks": [
+                {
+                    "sub_index": t.sub_index,
+                    "stream_index": t.stream_index,
+                    "codec_name": t.codec_name,
+                    "language": t.language,
+                    "title": t.title,
+                    "default": t.default,
+                    "forced": t.forced,
+                    "format": t.format,
+                    "burnable": t.burnable,
+                }
+                for t in tracks
+            ],
+        }, ensure_ascii=False, indent=2))
+    elif tracks:
+        print(f"{args.video}: {len(tracks)} 条字幕轨")
+        for t in tracks:
+            print(f"  {t.describe()}")
+    else:
+        print(f"{args.video}: 未找到内嵌字幕轨")
+    return 0
+
+
+def _run_burn_track(args: argparse.Namespace) -> int:
+    """``burn-track`` 子命令：选择 -> 抽取 -> 复用既有渲染管道。"""
+    output = args.output or str(
+        Path(args.video).with_name(Path(args.video).stem + "_subbed.mp4")
+    )
+    last_pct = -1
+
+    def on_progress(ratio: float) -> None:
+        nonlocal last_pct
+        pct = int(ratio * 100)
+        if pct != last_pct and not args.json:
+            last_pct = pct
+            print(f"\r烧录进度: {pct:3d}%", end="", file=sys.stderr, flush=True)
+
+    try:
+        result = burn_track(
+            args.video, output,
+            stream_index=args.stream, sub_index=args.sub_index,
+            language=args.lang, title=args.title,
+            strict=args.strict, crf=args.crf, preset=args.preset,
+            overwrite=args.overwrite, progress_callback=on_progress,
+        )
+    except (FileNotFoundError, TrackError) as exc:
+        # 轨道枚举/选择/抽取问题属于用法错误，与字幕解析失败同码
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    except (FileExistsError, ValueError, RuntimeError) as exc:
+        print(f"\n错误: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps({
+            "format": "embedded-track",
+            "track": result.track,
+            "output": result.output, "width": result.width,
+            "height": result.height, "fps": result.fps,
+            "frames_written": result.frames_written, "cues": result.cues,
+            "encoder": result.encoder, "had_audio": result.had_audio,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n完成: {result.output} (轨 [{result.track}], "
+              f"{result.width}x{result.height} @ {result.fps:g}fps, "
+              f"{result.frames_written} 帧, {result.cues} 条字幕"
               f"{', 含音频' if result.had_audio else ', 无音频'})")
     return 0
 
