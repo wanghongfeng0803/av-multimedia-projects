@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+demo/out*.mp4
+demo/out.mkv
+demo/frame_*.png
