@@ -30,6 +30,7 @@ ASS 与 SRT 的根本区别在于「样式」与「特效」：
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, replace
 from typing import BinaryIO
@@ -181,9 +182,11 @@ class ASSStyle:
 
         def num(key: str, default: float) -> float:
             try:
-                return float(data.get(key, ""))
+                v = float(data.get(key, ""))
             except ValueError:
                 return default
+            # NaN/Inf 能通过 float() 但会污染后续像素几何，按坏值处理
+            return v if math.isfinite(v) else default
 
         def color(key: str, default: ASSColor) -> ASSColor:
             raw = data.get(key, "")
@@ -314,11 +317,8 @@ class ASSDocument:
         return ASSStyle(name="Default")
 
 
-# -- 标签分词：带括号参数的标签（\pos(...)）与裸标签（\b1、\k40）分开匹配，
-#    每次只吃一个标签，游标推进路径简单且可单测。裸标签的参数允许为空，
-#    否则单个无参标签（如裸 \r）会让整个分词循环提前退出 -----------------
-_TAG_PAREN_RE = re.compile(r"([a-zA-Z]+)\(([^()]*)\)")
-_TAG_BARE_RE = re.compile(r"([a-zA-Z]+)([^\\]*)")
+# -- 标签分词：先读反斜杠引导的标签名，再按「括号参数 / 吃到下一反斜杠」
+#    两种形态取参数。参数允许为空，裸 \r、\b 这类无参标签不会截断分词 ----
 _TAG_NAME_RE = re.compile(r"[a-zA-Z]+")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
@@ -385,28 +385,24 @@ def _parse_tag_block(block: str, state: _RunState, styles: dict[str, ASSStyle],
     """
     if not block.startswith("\\"):
         return
-    i, n = 1, len(block)
-    while i < n:
-        if block[i] == "\\":  # 连续反斜杠：跳过分隔符
-            i += 1
+    # 在每个反斜杠处把标签块切成 token：首元素是前导反斜杠左侧的空串。
+    # 每个 token = 标签名 + 紧随的原文参数（括号或裸文本，均可为空）。
+    for part in block.split("\\")[1:]:
+        name_m = _TAG_NAME_RE.match(part)
+        if not name_m:
             continue
-        if block[i:i + 1] == "r":
-            # \r[样式名]：名字取到下一个反斜杠或块尾（裸 \r 时名为空串）
-            nxt = block.find("\\", i)
-            token = block[i:] if nxt < 0 else block[i:nxt]
-            _apply_reset(state, styles, default_style, token[1:])
-            i = n if nxt < 0 else nxt
-            continue
-        m = _TAG_PAREN_RE.match(block, i)
-        if m:
-            raw_name, args = m.group(1), m.group(2)
-            i = m.end()
+        raw_name = name_m.group(0)
+        rest = part[name_m.end():]
+        if rest.startswith("("):
+            close = rest.find(")")
+            args = rest[1:close] if close >= 0 else rest[1:]  # 括号未闭合容错
         else:
-            m = _TAG_BARE_RE.match(block, i)
-            if not m:
-                return
-            raw_name, args = m.group(1), m.group(2)
-            i = m.end()
+            args = rest
+
+        # \r[样式名]：重置行内状态；样式名直接挂在标签名后（无分隔符）
+        if raw_name.lower() == "r":
+            _apply_reset(state, styles, default_style, args)
+            continue
         # 大写 \K 是 \kf 的历史别名；其余标签名统一小写分派
         name = "kf" if raw_name == "K" else raw_name.lower()
 
@@ -492,8 +488,6 @@ def _parse_tag_block(block: str, state: _RunState, styles: dict[str, ASSStyle],
             # 实现，进入后跳过产生的文本 run。
             v = _first_number(args)
             state.drawing = v is not None and int(v) != 0
-        elif name == "r":
-            pass  # 已在分词循环入口特殊处理（需要携带可选样式名）
         # 其余标签（q/n/fr/fax/blur/bord/shad/2c/3c/4c/t……）安静忽略
 
 

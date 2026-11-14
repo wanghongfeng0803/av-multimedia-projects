@@ -1,0 +1,23 @@
+[Script Info]
+Title: subburn ASS 端到端验证
+ScriptType: v4.00+
+PlayResX: 320
+PlayResY: 240
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,18,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,12,1
+Style: Title,微软雅黑,22,&H0000FFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1,0,8,10,10,10,1
+Style: Opaque,Arial,16,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,1,1,0,100,100,0,0,3,2,0,5,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.20,0:00:01.20,Default,,0,0,0,,普通 {\b1}粗体{\r} 与 {\i1}斜体{\r} 混排
+Dialogue: 0,0:00:00.30,0:00:01.50,Title,,0,0,0,,顶部标题 {\c&H000000FF&}变红
+Dialogue: 0,0:00:00.50,0:00:01.80,Opaque,,0,0,0,,不透明底盒 {\u1}下划线
+Dialogue: 0,0:00:00.40,0:00:01.60,Default,,0,0,0,,{\an7\pos(20,60)}绝对定位文本
+Dialogue: 0,0:00:00.60,0:00:01.40,Default,,0,0,0,,{\fad(200,200)}淡入淡出
+Dialogue: 0,0:00:00.20,0:00:01.80,Default,,0,0,0,,{\k40}卡拉 {\k60}OK 变色
+Dialogue: 0,0:00:00.20,0:00:01.80,Default,,0,0,0,,{\move(0,200,240,200)}移动字幕

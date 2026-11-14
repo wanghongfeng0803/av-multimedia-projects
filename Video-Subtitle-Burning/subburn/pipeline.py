@@ -31,12 +31,19 @@ from typing import Callable
 
 from .fonts import Font, load_font, resolve_font
 from .render import OverlayRenderer, Style
+from .ass import ASSDocument
+from .ass_render import ASSRenderer
 from .srt import Cue
 from .style import SubtitleStyle
-from .timeline import FrameTimeline, SubtitleScheduler
+from .timeline import FrameTimeline, SubtitleScheduler, frame_time_ms
 
-__all__ = ["BurnResult", "probe_video", "burn_subtitles"]
+__all__ = ["BurnResult", "probe_video", "burn_subtitles", "burn_ass"]
 
+#: 逐帧渲染回调：拿到 RGB24 帧缓冲与帧坐标，就地把字幕画进去。
+#: SRT 与 ASS 两条流水线共用同一个 ffmpeg 泵，差别只在这个回调。
+FrameCallback = Callable[
+    [bytearray, int, int, int, float], None
+]
 #: 进度回调，参数为 0.0~1.0 的完成比例
 ProgressCallback = Callable[[float], None]
 
@@ -190,10 +197,17 @@ def burn_subtitles(
     renderer = OverlayRenderer(font, style or Style())
     scheduler = SubtitleScheduler(cues, fps=fps)
 
+    def on_frame(buf: bytearray, width: int, height: int,
+                 frame_idx: int, now_ms: float) -> None:
+        active = scheduler.active_cues_at(frame_idx)
+        if active:
+            renderer.render_frame(buf, width, height,
+                                  [c.text for c in active])
+
     with tempfile.TemporaryDirectory(prefix="subburn_") as tmpdir:
         audio_path = _extract_audio(input_path, tmpdir)
         frames_written = _pump_frames(
-            input_path, output_path, timeline, renderer, scheduler,
+            input_path, output_path, timeline, on_frame,
             audio_path, crf, preset, progress_callback,
         )
 
@@ -207,13 +221,66 @@ def burn_subtitles(
     )
 
 
+def burn_ass(
+    input_path: str,
+    output_path: str,
+    document: ASSDocument,
+    *,
+    crf: int = 23,
+    preset: str = "medium",
+    overwrite: bool = False,
+    progress_callback: ProgressCallback | None = None,
+) -> BurnResult:
+    """把 ASS 文档烧录进视频，返回执行结果摘要。
+
+    与 :func:`burn_subtitles` 共用解码/编码双进程与音频直通，差异完全
+    封装在 :class:`~subburn.ass_render.ASSRenderer` 的逐帧回调里：
+    调度器只负责判断哪些 :class:`~subburn.ass.ASSCue` 在场，样式、特效、
+    定位均由渲染器按 ASS 语义处理。
+    """
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(input_path)
+    if os.path.exists(output_path) and not overwrite:
+        raise FileExistsError(f"输出已存在（需 overwrite=True）: {output_path}")
+
+    timeline = probe_video(input_path)
+    w, h, fps = timeline.width, timeline.height, timeline.fps
+    renderer = ASSRenderer(document, w, h)
+    scheduler = SubtitleScheduler(list(document.cues), fps=fps)
+
+    def on_frame(buf: bytearray, width: int, height: int,
+                 frame_idx: int, now_ms: float) -> None:
+        active = scheduler.active_cues_at(frame_idx)
+        if active:
+            renderer.render_frame(buf, width, height, active, now_ms)
+
+    with tempfile.TemporaryDirectory(prefix="subburn_") as tmpdir:
+        audio_path = _extract_audio(input_path, tmpdir)
+        frames_written = _pump_frames(
+            input_path, output_path, timeline, on_frame,
+            audio_path, crf, preset, progress_callback,
+        )
+
+    return BurnResult(
+        output=output_path,
+        width=w, height=h, fps=fps,
+        frames_written=frames_written,
+        cues=len(document.cues),
+        encoder="libx264",
+        had_audio=audio_path is not None,
+    )
+
+
 def _pump_frames(
     input_path: str, output_path: str, timeline: FrameTimeline,
-    renderer: OverlayRenderer, scheduler: SubtitleScheduler,
-    audio_path: str | None, crf: int, preset: str,
-    progress_callback: ProgressCallback | None,
+    on_frame: FrameCallback, audio_path: str | None, crf: int,
+    preset: str, progress_callback: ProgressCallback | None,
 ) -> int:
-    """拉起解码/编码两个进程，按帧大小在管道间搬运并就地渲染。"""
+    """拉起解码/编码两个进程，按帧大小在管道间搬运并就地渲染。
+
+    渲染动作完全由 ``on_frame(buf,w,h,frame_idx,now_ms)`` 回调承担，
+    使 SRT/ASS 两条路径共享同一份进程管理、读写循环与异常处理。
+    """
     w, h, fps = timeline.width, timeline.height, timeline.fps
     frame_bytes = w * h * 3
 
@@ -252,9 +319,7 @@ def _pump_frames(
             if len(frame) < frame_bytes:
                 break  # 读到 EOF（最后一帧不足整帧说明流异常截断，丢弃残帧）
             buf = bytearray(frame)
-            active = scheduler.active_cues_at(frame_idx)
-            if active:
-                renderer.render_frame(buf, w, h, [c.text for c in active])
+            on_frame(buf, w, h, frame_idx, frame_time_ms(frame_idx, fps))
             encoder.stdin.write(buf)
             frame_idx += 1
             if progress_callback and total:

@@ -45,31 +45,74 @@ class TestBitmapFontBold:
         assert BitmapFont(1).bold is False
 
 
+class TestBitmapFontItalic:
+    def test_italic_flags_and_wider_metrics(self):
+        upright = BitmapFont(2)
+        oblique = BitmapFont(2, italic=True)
+        assert upright.italic is False and oblique.italic is True
+        assert oblique.text_size("A")[0] > upright.text_size("A")[0]
+
+    def test_italic_bottom_row_shifts_right(self):
+        # 切变语义：L 字形顶/底行墨迹原始起点都在 x=0，斜体后底行应右移
+        f = BitmapFont(1, italic=True)
+        buf = f.rasterize_line("L", (255, 255, 255))
+        w, h = f.text_size("L")
+
+        def ink_cols(row):
+            return [x for x in range(w)
+                    if buf[(row * w + x) * 4 + 3] == 255]
+
+        assert min(ink_cols(0)) == 0
+        assert min(ink_cols(h - 1)) == f._row_shift(h - 1) > 0
+
+    def test_italic_bitmap_via_registry_fallback(self):
+        # 空候选表：斜体请求落到位图字体并带上切变标志
+        reg = FontRegistry(candidate_paths=())
+        font = reg.resolve(
+            FontSpec(size=28, italic=True), fallback_size=28)
+        assert isinstance(font, BitmapFont) and font.italic is True
+
+
 class TestFilenameParsing:
     def test_regular_filenames(self):
-        assert parse_font_filename("arial.ttf") == ("arial", FontWeight.REGULAR)
+        assert parse_font_filename("arial.ttf") == (
+            "arial", FontWeight.REGULAR, False)
         assert parse_font_filename("msyh.ttc") == (
-            "microsoft yahei", FontWeight.REGULAR)
+            "microsoft yahei", FontWeight.REGULAR, False)
         assert parse_font_filename("NotoSansCJK-Regular.ttc") == (
-            "noto sans cjk", FontWeight.REGULAR)
+            "noto sans cjk", FontWeight.REGULAR, False)
 
     def test_separated_weight_suffix(self):
         assert parse_font_filename("DejaVuSans-Bold.ttf") == (
-            "dejavu sans", FontWeight.BOLD)
-        assert parse_font_filename("Foo-Light.otf") == ("foo", FontWeight.LIGHT)
-        assert parse_font_filename("Foo_Black.ttf") == ("foo", FontWeight.BLACK)
+            "dejavu sans", FontWeight.BOLD, False)
+        assert parse_font_filename("Foo-Light.otf") == (
+            "foo", FontWeight.LIGHT, False)
+        assert parse_font_filename("Foo_Black.ttf") == (
+            "foo", FontWeight.BLACK, False)
 
     def test_concatenated_abbreviated_suffix(self):
         # Windows 常见连体缩写
-        assert parse_font_filename("arialbd.ttf") == ("arial", FontWeight.BOLD)
+        assert parse_font_filename("arialbd.ttf") == (
+            "arial", FontWeight.BOLD, False)
         assert parse_font_filename("msyhbd.ttc") == (
-            "microsoft yahei", FontWeight.BOLD)
-        assert parse_font_filename("arialbi.ttf") == ("arial", FontWeight.BOLD)
+            "microsoft yahei", FontWeight.BOLD, False)
+        assert parse_font_filename("arialbi.ttf") == (
+            "arial", FontWeight.BOLD, True)
 
     def test_italic_does_not_change_weight(self):
-        assert parse_font_filename("ariali.ttf") == ("arial", FontWeight.REGULAR)
-        family, weight = parse_font_filename("DejaVuSans-BoldOblique.ttf")
+        assert parse_font_filename("ariali.ttf") == (
+            "arial", FontWeight.REGULAR, True)
+        family, weight, italic = parse_font_filename(
+            "DejaVuSans-BoldOblique.ttf")
         assert family == "dejavu sans" and weight is FontWeight.BOLD
+        assert italic is True
+
+    def test_italic_concat_tokens(self):
+        assert parse_font_filename("FooIt.ttf")[2] is True
+        assert parse_font_filename("Foo-Italic.otf")[2] is True
+        # simkai 以单个 i 结尾，不应误判为斜体（连体后缀要求长度 >=2）
+        assert parse_font_filename("simkai.ttf") == (
+            "simkai", FontWeight.REGULAR, False)
 
 
 class TestRegistryFallback:
@@ -162,6 +205,37 @@ class TestRegistryWithRealFonts:
             FontSpec(families=("DefinitelyMissing", known), size=24),
             fallback_size=24)
         assert not isinstance(font, BitmapFont)
+
+    def test_italic_prefers_native_italic_file(self):
+        reg = self.registry
+        for family, table in reg._italic_by_family.items():
+            path = table.get(FontWeight.REGULAR)
+            if not path:
+                continue
+            font = reg.resolve(
+                FontSpec(families=(family,), size=24, italic=True),
+                fallback_size=24)
+            assert not isinstance(font, BitmapFont)
+            assert font.font_path == path and font.italic is False
+            return
+        pytest.skip("本机没有登记原生斜体文件")
+
+    def test_missing_italic_synthesizes_oblique(self):
+        reg = self.registry
+        # 找一个只有常规文件、没有斜体文件的族
+        for family, table in reg._by_family.items():
+            if family in reg._italic_by_family:
+                continue
+            path = table.get(FontWeight.REGULAR)
+            if not path:
+                continue
+            font = reg.resolve(
+                FontSpec(families=(family,), size=24, italic=True),
+                fallback_size=24)
+            assert not isinstance(font, BitmapFont)
+            assert font.italic is True  # 无原生斜体 -> 合成切变
+            return
+        pytest.skip("本机所有族都带斜体文件，无法验证合成路径")
 
     def test_explicit_path_bypasses_family_table(self):
         self.registry._scan()

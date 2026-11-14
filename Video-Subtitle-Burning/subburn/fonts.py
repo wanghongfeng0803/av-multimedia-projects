@@ -33,7 +33,7 @@ from .style import FontSpec, FontWeight
 
 __all__ = [
     "Font", "BitmapFont", "PillowFont", "FontRegistry",
-    "load_font", "resolve_font", "get_registry",
+    "load_font", "resolve_font", "get_registry", "parse_font_filename",
 ]
 
 # 5(宽) x 7(高) 点阵：# 为墨水像素。小写字母在查表时归一化为大写。
@@ -104,6 +104,8 @@ class Font(Protocol):
     line_height: int
     #: 是否为合成粗体（无原生 bold 字形时由光栅化层描厚）
     bold: bool
+    #: 是否为合成斜体（无原生 italic 字形时由光栅化层切变）
+    italic: bool
 
     def text_size(self, text: str) -> tuple[int, int]:
         """单行文本渲染后的像素宽高。"""
@@ -121,27 +123,47 @@ class BitmapFont:
 
     ``bold=True`` 时每个墨水像素向右多印一列，用二次叠印模拟合成粗体；
     宽度相应增加 1 个缩放单位，避免新墨迹被裁掉。
+    ``italic=True`` 时对每行做约 2:7 的水平切变（oblique）——越靠下的
+    扫描行右移越多，顶部预留切变余量防止左下角墨迹出界；位图字体没有
+    原生斜体字形，斜体永远是合成的。
     """
 
-    def __init__(self, scale: int = 3, bold: bool = False):
+    #: 斜体切变斜率（水平位移/行高），与常见 oblique 字体的观感接近
+    _SHEAR_NUM, _SHEAR_DEN = 2, 7
+
+    def __init__(self, scale: int = 3, bold: bool = False,
+                 italic: bool = False):
         if scale < 1:
             raise ValueError("scale 必须 >= 1")
         self.scale = scale
         self.bold = bool(bold)
+        self.italic = bool(italic)
         # 每个字形后留 1 个像素的字间距，行高留 1 像素下行余量
         self.advance = (_GLYPH_W + 1) * scale
         self.line_height = (_GLYPH_H + 1) * scale
         # 合成粗体额外占用的宽度（像素）
         self._bold_extra = scale if bold else 0
+        # 斜体在字形高度上的最大右移量（底部扫描行），同时也是顶部预留
+        self._shear = (
+            (_GLYPH_H * scale * self._SHEAR_NUM + self._SHEAR_DEN - 1)
+            // self._SHEAR_DEN if italic else 0
+        )
 
     def _glyph(self, ch: str) -> tuple[str, ...]:
         return _GLYPHS.get(ch.upper(), _BOX_GLYPH)
 
+    def _row_shift(self, y: int) -> int:
+        """输出缓冲第 y 行相对直立字形的右移量（斜体切变，向下递增）。"""
+        if not self.italic:
+            return 0
+        return (y * self._SHEAR_NUM) // self._SHEAR_DEN
+
     def text_size(self, text: str) -> tuple[int, int]:
         if not text:
             return 0, self.line_height
-        # 末尾不留字间距；粗体外扩计入整体宽度
-        w = len(text) * self.advance - self.scale + self._bold_extra
+        # 末尾不留字间距；粗体外扩计入整体宽度；斜体底部右移也计入
+        w = (len(text) * self.advance - self.scale
+             + self._bold_extra + self._shear)
         return w, _GLYPH_H * self.scale
 
     def rasterize_line(self, text: str, color: tuple[int, int, int]) -> bytearray:
@@ -151,6 +173,8 @@ class BitmapFont:
         for ci, ch in enumerate(text):
             x0 = ci * self.advance
             for ry, row in enumerate(self._glyph(ch)):
+                # 斜体：同一个字形行内所有像素统一右移，行间位移线性递增
+                row_shift = self._row_shift(ry * s)
                 for gx, px in enumerate(row):
                     if px != "#":
                         continue
@@ -159,7 +183,9 @@ class BitmapFont:
                     for b_off in offsets:
                         for dy in range(s):
                             base = (
-                                (ry * s + dy) * width + x0 + gx * s + b_off
+                                (ry * s + dy) * width
+                                + x0 + gx * s + b_off
+                                + self._row_shift(ry * s + dy)
                             ) * 4
                             for dx in range(s):
                                 off = base + dx * 4
@@ -172,25 +198,32 @@ class PillowFont:
     """基于 Pillow 的 TTF 光栅化；仅在 Pillow 与字体文件都可用时构造。
 
     ``synthetic_bold=True`` 表示文件本身不含 bold 字重，绘制时以 1 像素
-    横向偏移重复盖印模拟加粗（:class:`FontRegistry` 选档失败时使用）。
+    横向偏移重复盖印模拟加粗（:class:`FontRegistry` 选档失败时使用）；
+    ``synthetic_italic=True`` 同理，用 AFFINE 水平切变把直立字形拉成
+    oblique（无原生 italic 文件时的兜底）。
     """
 
-    def __init__(self, font_path: str, size: int, synthetic_bold: bool = False):
+    def __init__(self, font_path: str, size: int,
+                 synthetic_bold: bool = False,
+                 synthetic_italic: bool = False):
         from PIL import ImageFont  # 懒加载：无 Pillow 环境不受影响
 
         self.font_path = font_path
         self.font = ImageFont.truetype(font_path, size)
         self.bold = bool(synthetic_bold)
+        self.italic = bool(synthetic_italic)
         # 用 ascender/descender 算稳定行高，避免不同字形度量抖动
         asc, desc = self.font.getmetrics()
-        self.line_height = asc + desc
         self._ascent = asc
+        # 斜体切变在字形高度上的最大右移量，计入画布宽度防右侧裁切
+        self._shear = ((asc + desc) * 2 // 7) if synthetic_italic else 0
+        self.line_height = asc + desc
 
     def text_size(self, text: str) -> tuple[int, int]:
         if not text:
             return 0, self.line_height
         box = self.font.getbbox(text)
-        width = box[2] - box[0] + (1 if self.bold else 0)
+        width = box[2] - box[0] + (1 if self.bold else 0) + self._shear
         return width, box[3] - box[1]
 
     def rasterize_line(self, text: str, color: tuple[int, int, int]) -> bytearray:
@@ -203,11 +236,28 @@ class PillowFont:
         img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         # getbbox 的左上可能非 0，绘制时反向偏移，使墨迹对齐 (0,0)
         box = self.font.getbbox(text)
+        ox, oy = -box[0], -box[1]
         draw = ImageDraw.Draw(img)
-        draw.text((-box[0], -box[1]), text, font=self.font,
-                  fill=color + (255,))
+        if self.italic:
+            # 先在独立图层直立绘制（含合成粗体），再整体水平切变贴回，
+            # 切变矩阵 (a,b,c,d,e,f)：x' = a*x + c*y + e，c=2/7 即 oblique
+            glyph_w = width - self._shear
+            layer = Image.new("RGBA", (max(1, glyph_w), height),
+                              (0, 0, 0, 0))
+            ldraw = ImageDraw.Draw(layer)
+            ldraw.text((ox, oy), text, font=self.font, fill=color + (255,))
+            if self.bold:  # 合成粗体：右移 1px 再盖一次，笔画横向增厚
+                ldraw.text((ox + 1, oy), text, font=self.font,
+                           fill=color + (255,))
+            img = layer.transform(
+                (width, height), Image.AFFINE,
+                # Pillow AFFINE 是输出->输入的逆映射：x_in = x_out - 2/7·y_out
+                (1, -2 / 7, 0, 0, 1, 0), resample=Image.BILINEAR,
+            )
+            return bytearray(img.tobytes())
+        draw.text((ox, oy), text, font=self.font, fill=color + (255,))
         if self.bold:  # 合成粗体：右移 1px 再盖一次，笔画横向增厚
-            draw.text((-box[0] + 1, -box[1]), text, font=self.font,
+            draw.text((ox + 1, oy), text, font=self.font,
                       fill=color + (255,))
         return bytearray(img.tobytes())
 
@@ -260,16 +310,16 @@ _WEIGHT_TOKEN_MAP = {
 _ITALIC_TOKENS = {"italic", "ital", "oblique", "it"}
 
 #: 已知连体缩写词表（Windows 命名习惯，整体匹配以免误伤族名末字母，
-#: 例如 simkai 不能因为末尾的 i 被当成斜体剥掉）
+#: 例如 simkai 不能因为末尾的 i 被当成斜体剥掉）。值为 (族键, 字重, 斜体)
 _STEM_ALIASES = {
-    "arial": ("arial", FontWeight.REGULAR),
-    "arialbd": ("arial", FontWeight.BOLD),
-    "ariali": ("arial", FontWeight.REGULAR),
-    "arialbi": ("arial", FontWeight.BOLD),
-    "msyh": ("microsoft yahei", FontWeight.REGULAR),
-    "msyhbd": ("microsoft yahei", FontWeight.BOLD),
-    "msyhl": ("microsoft yahei", FontWeight.LIGHT),
-    "simhei": ("simhei", FontWeight.REGULAR),
+    "arial": ("arial", FontWeight.REGULAR, False),
+    "arialbd": ("arial", FontWeight.BOLD, False),
+    "ariali": ("arial", FontWeight.REGULAR, True),
+    "arialbi": ("arial", FontWeight.BOLD, True),
+    "msyh": ("microsoft yahei", FontWeight.REGULAR, False),
+    "msyhbd": ("microsoft yahei", FontWeight.BOLD, False),
+    "msyhl": ("microsoft yahei", FontWeight.LIGHT, False),
+    "simhei": ("simhei", FontWeight.REGULAR, False),
 }
 
 #: 已知连体文件名（无分隔符）的后缀，按长度降序匹配
@@ -278,18 +328,20 @@ _CONCAT_SUFFIXES = sorted(
 )
 
 
-def parse_font_filename(path: str) -> tuple[str, FontWeight]:
-    """从字体文件名解析 ``(内部族键, 字重)``。
+def parse_font_filename(path: str) -> tuple[str, FontWeight, bool]:
+    """从字体文件名解析 ``(内部族键, 字重, 是否斜体)``。
 
     同时支持分隔符写法（``DejaVuSans-Bold``）与连体缩写（``arialbd``、
-    ``msyhbd``、``DejaVuSans-BoldOblique``）；斜体标记只剥离不参与字重。
-    连体后缀要求长度 >=2，避免误伤 ``simkai`` 这类以单个字母结尾的族名。
+    ``msyhbd``、``DejaVuSans-BoldOblique``）；斜体标记只影响第三返回值，
+    不参与字重。连体后缀要求长度 >=2，避免误伤 ``simkai`` 这类以单个字母
+    结尾的族名。
     """
     stem = os.path.splitext(os.path.basename(path))[0].lower()
     if stem in _STEM_ALIASES:
         return _STEM_ALIASES[stem]
 
     weight = FontWeight.REGULAR
+    italic = False
     family_parts: list[str] = []
     for token in re.split(r"[-_ .]", stem):
         if not token:
@@ -298,6 +350,7 @@ def parse_font_filename(path: str) -> tuple[str, FontWeight]:
             weight = _WEIGHT_TOKEN_MAP[token]
             continue
         if token in _ITALIC_TOKENS:
+            italic = True
             continue
         # 连体情况：循环剥离后缀，处理 bold+oblique 这类组合
         stripped = token
@@ -307,6 +360,7 @@ def parse_font_filename(path: str) -> tuple[str, FontWeight]:
                 stripped = ""
                 break
             if stripped in _ITALIC_TOKENS:
+                italic = True
                 stripped = ""
                 break
             matched = False
@@ -316,6 +370,8 @@ def parse_font_filename(path: str) -> tuple[str, FontWeight]:
                     stripped = stripped[: -len(suf)]
                     if suf in _WEIGHT_TOKEN_MAP:
                         weight = _WEIGHT_TOKEN_MAP[suf]
+                    else:  # 斜体后缀
+                        italic = True
                     matched = True
                     break
             if not matched:
@@ -328,10 +384,10 @@ def parse_font_filename(path: str) -> tuple[str, FontWeight]:
         "helvetica": "helvetica", "dejavusans": "dejavu sans",
         "notosanscjk": "noto sans cjk",
     }
-    return fixed.get(family, family), weight
+    return fixed.get(family, family), weight, italic
 
 
-# 向后兼容的两个薄封装（旧内部调用点）
+# 向后兼容的薄封装（旧内部调用点只需族键/字重）
 def _family_from_filename(path: str) -> str:
     return parse_font_filename(path)[0]
 
@@ -357,8 +413,11 @@ class FontRegistry:
     def __init__(self, candidate_paths: tuple[str, ...] = _CANDIDATE_FONTS):
         self._candidates = candidate_paths
         self._by_family: dict[str, dict[FontWeight, str]] = {}
+        # 斜体与常规分开索引：键与 _by_family 平行，存放斜体文件路径。
+        # 旧的 _by_family 结构与测试保持不变，斜体作为附加维度外挂。
+        self._italic_by_family: dict[str, dict[FontWeight, str]] = {}
         self._scanned = False
-        self._instance_cache: dict[tuple[str, int, bool], Font] = {}
+        self._instance_cache: dict[tuple, Font] = {}
 
     # -- 扫描 ------------------------------------------------------------
     def _scan(self) -> None:
@@ -367,53 +426,70 @@ class FontRegistry:
         for path in self._candidates:
             if not os.path.isfile(path):
                 continue
-            family = _family_from_filename(path)
-            weight = _weight_from_filename(path)
-            # 同档重复时保留先登记的（候选表本身按平台优先级排列）
-            self._by_family.setdefault(family, {}).setdefault(weight, path)
+            family, weight, italic = parse_font_filename(path)
+            if italic:
+                self._italic_by_family.setdefault(
+                    family, {}).setdefault(weight, path)
+            else:
+                # 同档重复时保留先登记的（候选表本身按平台优先级排列）
+                self._by_family.setdefault(family, {}).setdefault(weight, path)
         self._scanned = True
 
     def available_families(self) -> list[str]:
         self._scan()
-        return sorted(self._by_family)
+        return sorted(set(self._by_family) | set(self._italic_by_family))
 
     # -- 族解析 ----------------------------------------------------------
     def _resolve_family(self, family: str, weight: FontWeight,
-                        size: int) -> Font | None:
+                        size: int, want_italic: bool) -> Font | None:
         self._scan()
         if os.path.isfile(family):
-            # 直接给了字体文件路径：绕过族表，按文件名猜字重，缺失的字重
-            # 交给合成粗体兜底
-            native = _weight_from_filename(family)
+            # 直接给了字体文件路径：绕过族表，按文件名猜字重/斜体，缺失的
+            # 合成属性交给光栅化层兜底
+            native_w, native_i = parse_font_filename(family)[1:]
             return self._make_font(
                 family, size,
-                synthetic=weight is not native and weight.value >= FontWeight.BOLD.value,
+                synthetic_bold=(weight is not native_w
+                                and weight.value >= FontWeight.BOLD.value),
+                synthetic_italic=(want_italic and not native_i),
             )
         key = _normalize_family(family)
-        table = self._by_family.get(key)
-        if not table:
-            return None
+        italic_table = self._italic_by_family.get(key)
+        normal_table = self._by_family.get(key)
+        table = italic_table if want_italic else normal_table
+        # 斜体文件缺失时退回同族常规文件，稍后以合成 oblique 补偿
+        from_italic_table = table is not None
+        if table is None:
+            if not want_italic or not normal_table:
+                return None
+            table = normal_table
+        synthetic_italic = want_italic and not from_italic_table
         path = table.get(weight)
-        synthetic = False
+        synthetic_bold = False
         if path is None:
             # 就近选档：优先同方向差距最小的可用权重（注意 min 的结果是
             # 权重键，真正要打开的是 table 里登记的路径）
             chosen = min(table, key=lambda w: abs(w.value - weight.value))
             path = table[chosen]
             # 想要 bold 及以上但只找到更细的字体：合成加粗
-            synthetic = (
+            synthetic_bold = (
                 weight.value >= FontWeight.BOLD.value
                 and chosen.value < FontWeight.BOLD.value
             )
-        return self._make_font(path, size, synthetic)
+        return self._make_font(
+            path, size, synthetic_bold, synthetic_italic)
 
-    def _make_font(self, path: str, size: int, synthetic: bool) -> Font | None:
-        cache_key = (path, size, synthetic)
+    def _make_font(self, path: str, size: int,
+                   synthetic_bold: bool,
+                   synthetic_italic: bool = False) -> Font | None:
+        cache_key = (path, size, synthetic_bold, synthetic_italic)
         cached = self._instance_cache.get(cache_key)
         if cached is not None:
             return cached
         try:
-            font: Font = PillowFont(path, size, synthetic_bold=synthetic)
+            font: Font = PillowFont(
+                path, size, synthetic_bold=synthetic_bold,
+                synthetic_italic=synthetic_italic)
         except Exception:
             # 文件损坏/格式不支持：从本次候选中剔除，交由上层回退
             return None
@@ -423,33 +499,47 @@ class FontRegistry:
     def resolve(self, spec: FontSpec, *, fallback_size: int) -> Font:
         """按 :class:`FontSpec` 解析字体，执行完整回退链。
 
-        顺序：族链逐个匹配 -> 系统默认候选 -> 内置位图字体。位图字体仅
-        支持常规与合成粗体两档，且字号折算为最接近的整数缩放档。
+        顺序：族链逐个匹配（字重 + 斜体）-> 系统默认候选 -> 内置位图字体。
+        位图字体仅支持常规与合成粗体/斜体两档，字号折算为最接近的整数
+        缩放档。
         """
         size = spec.size if spec.size > 0 else fallback_size
         for family in spec.families:
-            font = self._resolve_family(family, spec.weight, size)
+            font = self._resolve_family(
+                family, spec.weight, size, spec.italic)
             if font is not None:
                 return font
-        # 族链全部未命中：退回候选表中第一个真正可加载的字体
+        # 族链全部未命中：退回候选表中第一个真正可加载的字体。
+        # 想要斜体时先扫斜体表（原生），再扫常规表（合成 oblique）。
         self._scan()
-        for table in self._by_family.values():
-            for weight, path in sorted(table.items(), key=lambda kv: kv[0].value):
-                synthetic = (
-                    spec.weight.value >= FontWeight.BOLD.value
-                    and weight.value < FontWeight.BOLD.value
-                )
-                font = self._make_font(path, size, synthetic)
-                if font is not None:
-                    return font
+        table_groups = []
+        if spec.italic:
+            table_groups = [
+                (list(self._italic_by_family.values()), False),
+                (list(self._by_family.values()), True),
+            ]
+        else:
+            table_groups = [(list(self._by_family.values()), False)]
+        for tables, synth_italic in table_groups:
+            for table in tables:
+                for weight, path in sorted(
+                        table.items(), key=lambda kv: kv[0].value):
+                    synthetic_bold = (
+                        spec.weight.value >= FontWeight.BOLD.value
+                        and weight.value < FontWeight.BOLD.value
+                    )
+                    font = self._make_font(
+                        path, size, synthetic_bold, synth_italic)
+                    if font is not None:
+                        return font
         # 最终保底：零依赖位图字体（同样进实例缓存，重复解析零成本）
         scale = max(1, round(size / _GLYPH_H))
         bold = spec.weight.value >= FontWeight.BOLD.value
-        cache_key = ("__bitmap__", scale, bold)
+        cache_key = ("__bitmap__", scale, bold, spec.italic)
         cached = self._instance_cache.get(cache_key)
         if cached is not None:
             return cached
-        font = BitmapFont(scale=scale, bold=bold)
+        font = BitmapFont(scale=scale, bold=bold, italic=spec.italic)
         self._instance_cache[cache_key] = font
         return font
 
@@ -484,20 +574,23 @@ def load_font(
     *,
     allow_pillow: bool = True,
     weight: FontWeight | int | str | None = None,
+    italic: bool = False,
 ) -> Font:
     """按优先级构造字体：显式路径 -> 系统 TTF（需 Pillow）-> 内置位图。
 
-    保留旧签名（``font_path/size/allow_pillow``），新增可选 ``weight``：
-    位图模式下 ``size`` 会被折算为最接近的缩放档（5x7 字形的整数倍）。
+    保留旧签名（``font_path/size/allow_pillow``），新增可选 ``weight`` 与
+    ``italic``：位图模式下 ``size`` 会被折算为最接近的缩放档（5x7 字形的
+    整数倍），斜体由切变合成。
     """
     fw = FontWeight.REGULAR if weight is None else FontWeight.parse(weight)
     if allow_pillow:
         spec = FontSpec(
             families=(font_path,) if font_path else (),
-            size=size, weight=fw,
+            size=size, weight=fw, italic=bool(italic),
         )
         # 显式路径用一次性注册表（不污染进程单例），否则走全局系统字体表
         registry = FontRegistry() if font_path else get_registry()
         return registry.resolve(spec, fallback_size=size)
     scale = max(1, round(size / _GLYPH_H))
-    return BitmapFont(scale=scale, bold=fw.value >= FontWeight.BOLD.value)
+    return BitmapFont(scale=scale, bold=fw.value >= FontWeight.BOLD.value,
+                      italic=bool(italic))

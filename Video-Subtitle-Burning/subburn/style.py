@@ -435,22 +435,25 @@ class FontWeight(Enum):
 
 @dataclass(frozen=True)
 class FontSpec:
-    """字体规格：字体族回退链 + 字号 + 字重。
+    """字体规格：字体族回退链 + 字号 + 字重 + 斜体。
 
     :param families: 按优先级排列的字体族名/字体文件路径；空元组表示交给
         :mod:`subburn.fonts` 走系统默认探测链。
     :param size: 像素字号；``0`` 表示按视频高度自动选择。
+    :param italic: 是否请求斜体；无原生斜体文件时由光栅化层合成 oblique。
     """
 
     families: tuple[str, ...] = ()
     size: int = 0
     weight: FontWeight = FontWeight.REGULAR
+    italic: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.size, int) or self.size < 0:
             raise ValueError(f"字号必须是非负整数（0 为自动），收到 {self.size!r}")
         if not isinstance(self.families, tuple):
             object.__setattr__(self, "families", tuple(self.families))
+        object.__setattr__(self, "italic", bool(self.italic))
 
     @classmethod
     def parse(cls, spec: "FontSpec | dict | None") -> "FontSpec":
@@ -466,6 +469,7 @@ class FontSpec:
                 families=tuple(families),
                 size=int(spec.get("size", 0)),
                 weight=FontWeight.parse(spec.get("weight", FontWeight.REGULAR)),
+                italic=bool(spec.get("italic", False)),
             )
         raise ValueError(f"无法解析字体规格: {spec!r}")
 
@@ -698,6 +702,7 @@ class SubtitleStyle:
                 "families": list(self.font.families),
                 "size": self.font.size,
                 "weight": self.font.weight.name.lower(),
+                "italic": self.font.italic,
             },
             "color": self.color.to_hex(),
             "outline_color": self.outline_color.to_hex(),

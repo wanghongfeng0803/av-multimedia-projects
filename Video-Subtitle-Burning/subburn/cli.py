@@ -1,12 +1,15 @@
 """命令行入口：``python -m subburn burn video.mp4 subs.srt -o out.mp4``。
 
-样式有两条等价配置路径，可叠加使用（命令行单项参数优先级高于 JSON 文件）：
+支持两种字幕格式，按扩展名（``.ass``/``.ssa``）或文件内容自动识别：
 
-* ``--style style.json``：完整 :class:`~subburn.style.SubtitleStyle` 的 JSON
-  描述，字段名与 :meth:`SubtitleStyle.from_dict` 一致；
-* 单项参数：``--font-family``（可重复构成回退链）、``--font-weight``、
-  ``--color`` / ``--alpha``、``--outline-color``、``--halign`` /
-  ``--valign``、``--margin`` 等，适合快速调整。
+* **SRT**：样式有两条等价配置路径，可叠加使用（命令行单项参数优先级
+  高于 JSON 文件）——``--style style.json`` 完整
+  :class:`~subburn.style.SubtitleStyle` 描述；以及 ``--font-family``、
+  ``--font-weight``、``--color`` / ``--alpha``、``--outline-color``、
+  ``--halign`` / ``--valign``、``--margin`` 等单项参数；
+* **ASS/SSA**：样式与特效完全由字幕文件内的 ``[V4+ Styles]`` 与行内
+  覆盖标签决定，SRT 的样式覆盖参数在该模式下会被拒绝（避免「参数看似
+  生效却被忽略」的歧义）。
 """
 
 from __future__ import annotations
@@ -17,8 +20,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .ass import ASSParseError, parse_ass
 from .fonts import load_font
-from .pipeline import burn_subtitles
+from .pipeline import burn_ass, burn_subtitles
 from .render import Style
 from .srt import parse_srt_file
 from .style import (
@@ -32,18 +36,29 @@ from .style import (
     VAlign,
 )
 
+#: 这些单项样式参数只对 SRT 有意义；ASS 模式下出现即报错（--font 除外，
+#: ASS 渲染器走自己的字体回退链，外部字体文件无对应入口）
+_SRT_ONLY_ARGS = (
+    "style_file", "font", "font_family", "font_weight", "font_size",
+    "color", "alpha", "outline_color", "shadow_color",
+    "halign", "valign", "margin", "box", "no_box",
+)
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subburn",
-        description="SRT 字幕解析与视频烧录（状态机解析 + 帧级时间对齐 + 像素叠加）",
+        description="SRT/ASS 字幕解析与视频烧录（状态机解析 + 帧级时间对齐 + 像素叠加）",
     )
     parser.add_argument("--version", action="version", version=f"subburn {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("burn", help="把 SRT 字幕烧录进视频")
+    p = sub.add_parser("burn", help="把 SRT/ASS 字幕烧录进视频")
     p.add_argument("video", help="输入视频路径")
-    p.add_argument("srt", help="SRT 字幕文件路径")
+    # dest 沿用 "srt" 以兼容旧调用方/测试对命名空间属性名的依赖；
+    # 实际接受 .srt/.ass/.ssa，格式按内容自动识别
+    p.add_argument("srt", metavar="subtitle",
+                   help="字幕文件路径（.srt/.ass/.ssa，按内容自动识别）")
     p.add_argument("-o", "--output", help="输出路径（默认 <视频名>_subbed.mp4）")
 
     # -- 字体 ------------------------------------------------------------
@@ -77,7 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    choices=("ultrafast", "superfast", "veryfast", "faster",
                             "fast", "medium", "slow", "slower", "veryslow"))
     p.add_argument("--strict", action="store_true",
-                   help="SRT 格式异常时直接报错而非容忍恢复")
+                   help="字幕格式异常时直接报错而非容忍恢复（SRT/ASS 均适用）")
     p.add_argument("--no-box", action="store_true", help="关闭半透明底盒")
     p.add_argument("--box", action="store_true", help="强制开启半透明底盒")
     p.add_argument("--style", dest="style_file",
@@ -160,8 +175,48 @@ def _build_style(args: argparse.Namespace) -> Style | SubtitleStyle:
     return style
 
 
+def _is_ass_file(path: str) -> bool:
+    """按扩展名优先、内容兜底判断是否为 ASS/SSA。
+
+    扩展名命中 ``.ass``/``.ssa`` 直接认定；否则读取文件头检查
+    ``[Script Info]`` 段标记，使改了扩展名的 ASS 文件也能正确路由。
+    读取失败时退回 False，交给 SRT 解析器报出更贴切的错误。
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in (".ass", ".ssa"):
+        return True
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096).decode("utf-8", "ignore").lower()
+    except OSError:
+        return False
+    return "[script info]" in head
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    is_ass = _is_ass_file(args.srt)
+
+    if is_ass:
+        # ASS 的样式由文件自身描述，SRT 样式覆盖参数没有作用点；明确拒绝
+        # 而不是静默忽略，避免用户误以为 --color 等参数生效
+        given = []
+        for name in _SRT_ONLY_ARGS:
+            value = getattr(args, name)
+            if name == "font_size":
+                used = value and value > 0  # 默认 0 表示自动，不算显式给出
+            else:
+                used = value not in (None, False)
+            if used:
+                given.append(name)
+        if given:
+            print(
+                "错误：ASS/SSA 字幕的样式由文件内 [V4+ Styles] 与行内标签"
+                f"决定，以下参数不适用: {', '.join('--' + name.replace('_', '-') for name in given)}",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_ass(args)
 
     cues, warnings = parse_srt_file(args.srt, strict=args.strict)
     for msg in warnings:
@@ -205,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps({
+            "format": "srt",
             "output": result.output, "width": result.width,
             "height": result.height, "fps": result.fps,
             "frames_written": result.frames_written, "cues": result.cues,
@@ -215,6 +271,64 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n完成: {result.output} "
               f"({result.width}x{result.height} @ {result.fps:g}fps, "
               f"{result.frames_written} 帧, {result.cues} 条字幕"
+              f"{', 含音频' if result.had_audio else ', 无音频'})")
+    return 0
+
+
+def _run_ass(args: argparse.Namespace) -> int:
+    """ASS/SSA 路径：解析文档 -> burn_ass，错误码与 SRT 路径保持一致。"""
+    try:
+        document, warnings = parse_ass(args.srt, strict=args.strict)
+    except ASSParseError as exc:
+        print(f"错误: ASS 解析失败: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"错误: 无法读取字幕文件: {exc}", file=sys.stderr)
+        return 1
+    for msg in warnings:
+        print(f"[warn] {msg}", file=sys.stderr)
+    if not document.cues:
+        print("错误：ASS 中没有解析出任何有效对话", file=sys.stderr)
+        return 2
+
+    output = args.output or str(
+        Path(args.video).with_name(Path(args.video).stem + "_subbed.mp4")
+    )
+    last_pct = -1
+
+    def on_progress(ratio: float) -> None:
+        nonlocal last_pct
+        pct = int(ratio * 100)
+        if pct != last_pct and not args.json:
+            last_pct = pct
+            print(f"\r烧录进度: {pct:3d}%", end="", file=sys.stderr, flush=True)
+
+    try:
+        result = burn_ass(
+            args.video, output, document,
+            crf=args.crf, preset=args.preset,
+            overwrite=args.overwrite, progress_callback=on_progress,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"\n错误: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps({
+            "format": "ass",
+            "output": result.output, "width": result.width,
+            "height": result.height, "fps": result.fps,
+            "frames_written": result.frames_written, "cues": result.cues,
+            "encoder": result.encoder, "had_audio": result.had_audio,
+            "styles": len(document.styles),
+            "play_res": [document.play_res_x, document.play_res_y],
+            "warnings": warnings,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n完成: {result.output} "
+              f"({result.width}x{result.height} @ {result.fps:g}fps, "
+              f"{result.frames_written} 帧, {result.cues} 条对话, "
+              f"{len(document.styles)} 个样式"
               f"{', 含音频' if result.had_audio else ', 无音频'})")
     return 0
 
