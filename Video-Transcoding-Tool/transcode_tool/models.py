@@ -74,6 +74,9 @@ class TranscodeResult:
     duration_seconds: float | None
     warnings: list[str] = field(default_factory=list)
     ffmpeg_log_path: str | None = None
+    # 输出容器规范名（mp4 / webm / mkv）与实际选用的 ffmpeg 视频编码器
+    container: str | None = None
+    encoder: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -87,4 +90,6 @@ class TranscodeResult:
             "duration_seconds": self.duration_seconds,
             "warnings": self.warnings,
             "ffmpeg_log_path": self.ffmpeg_log_path,
+            "container": self.container,
+            "encoder": self.encoder,
         }

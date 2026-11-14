@@ -45,3 +45,14 @@ class FFmpegRunError(TranscodeError):
         super().__init__(message)
         self.stderr = stderr
         self.cmd = cmd or []
+
+
+class EncoderUnavailableError(TranscodeError):
+    """本机 ffmpeg 不支持目标编码所需的任何编码器。"""
+
+    exit_code = 7
+
+    def __init__(self, message: str, codec: str = "", candidates: list[str] | None = None):
+        super().__init__(message)
+        self.codec = codec
+        self.candidates = candidates or []

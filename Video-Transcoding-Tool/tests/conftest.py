@@ -122,3 +122,48 @@ def multi_stream_file(work_dir, ffmpeg) -> str:
         "-c:a", "aac", path,
     ])
     return path
+
+
+@pytest.fixture()
+def long_file(work_dir, ffmpeg) -> str:
+    """4 秒带音频的 H.264 输入，用于分段转码测试。"""
+    path = os.path.join(work_dir, "sample_long.mp4")
+    _run([
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-c:a", "aac", "-shortest", path,
+    ])
+    return path
+
+
+@pytest.fixture()
+def tenbit_file(work_dir, ffmpeg) -> str:
+    """10bit 像素格式输入，验证向 yuv420p 的降级转换。"""
+    path = os.path.join(work_dir, "sample_10bit.mkv")
+    _run([
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+        "-an", path,
+    ])
+    return path
+
+
+@pytest.fixture()
+def sparse_gop_file(work_dir, ffmpeg) -> str:
+    """稀疏关键帧输入（GOP 远长于分段长度），用于暴露分段寻址的时间戳错位。
+
+    30fps、-g 250 使关键帧间隔约 8.3s，而分段只有 1-2s，
+    输入寻址必然回退到更早的关键帧，是检验双 -ss 时间戳重置的严苛样本。
+    """
+    path = os.path.join(work_dir, "sample_sparse.mp4")
+    _run([
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+        "-c:v", "libx264", "-preset", "ultrafast", "-g", "250",
+        "-c:a", "aac", "-shortest", path,
+    ])
+    return path
