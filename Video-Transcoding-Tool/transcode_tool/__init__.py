@@ -32,6 +32,15 @@ from .containers import (
     list_containers,
     resolve_container,
 )
+from .bitrate import (
+    BitratePlan,
+    RateMode,
+    parse_bitrate,
+    format_bitrate,
+    plan_bitrate,
+    build_bitrate_encoder_args,
+)
+from .scale import ResolutionPlan, parse_resolution, build_scale_filter, even_floor
 
 __all__ = [
     # 核心 API
@@ -44,6 +53,8 @@ __all__ = [
     "CodecSpec",
     "EncoderSpec",
     "ContainerSpec",
+    "BitratePlan",
+    "ResolutionPlan",
     # 注册表查询
     "list_codecs",
     "resolve_codec",
@@ -51,6 +62,16 @@ __all__ = [
     "list_containers",
     "resolve_container",
     "ContainerError",
+    # 码率控制
+    "RateMode",
+    "parse_bitrate",
+    "format_bitrate",
+    "plan_bitrate",
+    "build_bitrate_encoder_args",
+    # 分辨率规划
+    "parse_resolution",
+    "build_scale_filter",
+    "even_floor",
     # 异常
     "TranscodeError",
     "BinaryNotFoundError",

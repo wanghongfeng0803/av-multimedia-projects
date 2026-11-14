@@ -109,10 +109,27 @@ def _numeric_preset(preset: str, spec: EncoderSpec, mapping: dict[str, int]) -> 
     )
 
 
+def numeric_preset_value(encoder: EncoderSpec, preset: str) -> int:
+    """把命名/数字 preset 解析为该编码器的原生数字档位。
+
+    仅适用于数字档位型编码器（cpu_used / svt / rav1e）；命名档位型
+    （libx264/libx265）没有数字语义，调用它会抛出 ValueError。
+    """
+    if encoder.preset_mode == "cpu_used":
+        return _numeric_preset(preset, encoder, _CPU_USED_MAP)
+    if encoder.preset_mode == "svt":
+        return _numeric_preset(preset, encoder, _SVT_MAP)
+    if encoder.preset_mode == "rav1e":
+        return _numeric_preset(preset, encoder, _RAV1E_MAP)
+    raise ValueError(
+        f"编码器 {encoder.name} 使用命名 preset，没有原生数字档位。"
+    )
+
+
 def build_video_encoder_args(
     codec: CodecSpec, encoder: EncoderSpec, crf: int, preset: str
 ) -> list[str]:
-    """生成 ``-c:v <enc> ...`` 之后的质量/速度参数片段。"""
+    """生成 ``-c:v <enc> ...`` 之后的质量/速度参数片段（常量质量模式）。"""
     validate_crf(codec, crf)
 
     if encoder.preset_mode == "named":
@@ -125,7 +142,7 @@ def build_video_encoder_args(
 
     if encoder.preset_mode == "cpu_used":
         # libvpx / libaom 常量质量模式：-b:v 0 + -crf，cpu-used 控速度
-        cpu_used = _numeric_preset(preset, encoder, _CPU_USED_MAP)
+        cpu_used = numeric_preset_value(encoder, preset)
         return [
             "-b:v", "0", "-crf", str(crf),
             "-cpu-used", str(cpu_used),
@@ -134,13 +151,13 @@ def build_video_encoder_args(
         ]
 
     if encoder.preset_mode == "svt":
-        numeric = _numeric_preset(preset, encoder, _SVT_MAP)
+        numeric = numeric_preset_value(encoder, preset)
         return ["-crf", str(crf), "-preset", str(numeric), *encoder.extra_args]
 
     if encoder.preset_mode == "rav1e":
         # rav1e 没有 CRF，使用 QP（0-255）：把通用 0-63 的 CRF 等比映射
         qp = round(crf * 255 / 63)
-        speed = _numeric_preset(preset, encoder, _RAV1E_MAP)
+        speed = numeric_preset_value(encoder, preset)
         return ["-qp", str(qp), "-speed", str(speed), *encoder.extra_args]
 
     # 注册表内部错误：新增 preset_mode 后忘了在这里分派

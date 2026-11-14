@@ -32,6 +32,7 @@ from fractions import Fraction
 from typing import List, Sequence
 
 from . import ebml
+from .chapters import Chapter
 from .errors import RemuxError
 from .matroska_ids import *  # noqa: F401,F403  本模块大量使用元素 ID 常量
 from .mp4_parser import Mp4File, Sample, Track
@@ -42,7 +43,7 @@ _TARGET_CLUSTER_SIZE = 5 * 1024 * 1024   # 达到该大小后在下一个视频�
 _HARD_CLUSTER_SIZE = 100 * 1024 * 1024   # 硬上限：即使没有关键帧也强制切分
 _BLOCK_TC_MIN, _BLOCK_TC_MAX = -32768, 32767  # SimpleBlock 相对时间码范围
 
-_WRITING_APP = "mp4-to-mkv-remuxer 0.2.0"
+_WRITING_APP = "mp4-to-mkv-remuxer 0.3.0"
 
 
 @dataclass
@@ -262,6 +263,54 @@ def _build_info(duration_ms: float) -> bytes:
         ebml.utf8_element(WRITING_APP, _WRITING_APP),
     ]
     return ebml.master_element(INFO, children)
+
+
+def _build_chapters(chapters: List[Chapter]) -> bytes:
+    """把 chpl 章节清单编码为 Matroska Chapters 主元素。
+
+    结构（单个 EditionEntry 容纳全部章节，MP4 chpl 本身是单层清单）::
+
+        Chapters
+          EditionEntry
+            EditionFlagHidden=0 / EditionFlagDefault=1
+            ChapterAtom × N
+              ChapterUID（确定性：取章节在归一化清单中的 1 起始序号）
+              ChapterTimeStart（纳秒；chpl 无结束时间，不写 ChapterTimeEnd）
+              ChapterFlagHidden=0 / ChapterFlagEnabled=1
+              ChapterDisplay
+                ChapString（标题，UTF-8）
+                ChapLanguage="und"（chpl 不携带语言标签）
+
+    ChapterUID 取序号而非哈希，使同一输入在任意机器、任意次数下
+    产出逐字节一致的输出（可复现性）。
+    """
+    atoms: List[bytes] = []
+    for index, chapter in enumerate(chapters, start=1):
+        display = ebml.master_element(
+            CHAPTER_DISPLAY,
+            [
+                ebml.utf8_element(CHAP_STRING, chapter.title),
+                ebml.string_element(CHAP_LANGUAGE, "und"),
+            ],
+        )
+        atom_children = [
+            ebml.uint_element(CHAPTER_UID, index),
+            ebml.uint_element(CHAPTER_TIME_START, chapter.start_ns),
+            ebml.uint_element(CHAPTER_FLAG_HIDDEN, 0),
+            ebml.uint_element(CHAPTER_FLAG_ENABLED, 1),
+            display,
+        ]
+        atoms.append(ebml.master_element(CHAPTER_ATOM, atom_children))
+
+    edition = ebml.master_element(
+        EDITION_ENTRY,
+        [
+            ebml.uint_element(EDITION_FLAG_HIDDEN, 0),
+            ebml.uint_element(EDITION_FLAG_DEFAULT, 1),
+            *atoms,
+        ],
+    )
+    return ebml.master_element(CHAPTERS, [edition])
 
 
 def _place_samples(
@@ -495,8 +544,13 @@ def write_mkv(mp4: Mp4File) -> bytes:
             )
         ],
     )
+    # 章节（chpl）作为 Segment 级主元素，位于 Tracks 之后、Cluster 之前；
+    # 无章节时不产生任何字节，输出与旧版本逐字节一致（除 WritingApp 版本号）
+    chapters = (
+        _build_chapters(mp4.chapters) if getattr(mp4, "chapters", None) else b""
+    )
     clusters = _build_clusters(mp4, placed)
 
-    segment_payload = info + tracks + b"".join(clusters)
+    segment_payload = info + tracks + chapters + b"".join(clusters)
     segment = ebml.master_element(SEGMENT, [segment_payload])
     return header + segment

@@ -39,3 +39,11 @@ class PlaylistError(PackagerError):
 
 class WatermarkError(PackagerError):
     """文字水印的渲染参数、字体或叠加过程出错。"""
+
+
+class EncryptionError(PackagerError):
+    """AES-128 分片加密的参数或执行过程出错。
+
+    覆盖密钥/IV 长度与格式非法、密钥 URI 含禁用字符、待加密数据
+    不是块尺寸整数倍（去填充阶段）、密文损坏等全部加密侧可预期错误。
+    """

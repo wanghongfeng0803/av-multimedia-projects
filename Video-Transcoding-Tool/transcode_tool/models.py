@@ -77,6 +77,9 @@ class TranscodeResult:
     # 输出容器规范名（mp4 / webm / mkv）与实际选用的 ffmpeg 视频编码器
     container: str | None = None
     encoder: str | None = None
+    # 请求的目标视频码率（bps）与速率模式；CRF 路线下为 None
+    target_bitrate_bps: int | None = None
+    rate_mode: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -92,4 +95,6 @@ class TranscodeResult:
             "ffmpeg_log_path": self.ffmpeg_log_path,
             "container": self.container,
             "encoder": self.encoder,
+            "target_bitrate_bps": self.target_bitrate_bps,
+            "rate_mode": self.rate_mode,
         }

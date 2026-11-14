@@ -48,6 +48,23 @@ alpha' = base_alpha · (1 - mask_strength · t)
 平坦区域保持原透明度，边缘/纹理（人脸轮廓、文字、物体边界）处自动变淡，
 `mask_strength=0` 时退化为固定透明度。
 
+### 5. 随时间变化的运动水印（关键帧轨迹）
+
+位置偏移与旋转角都是时间 t 的连续函数，由多关键帧分段插值得到：
+
+- **帧率映射**：`t = frame_index / fps`，支持 29.97 等任意正帧率，
+  整数帧索引先映射为秒再对轨迹求值；
+- **缓动插值**：`linear` / `ease-in` / `ease-out` / `ease-in-out`，
+  作用于每个关键帧段的进度参数；t 超出首末关键帧时保持端点状态；
+- **角度处理**：插值沿最短弧（350°→10° 走 +20°），最终结果归一化到
+  [0, 360)，负角度与超 360° 输入自动折叠；
+- **旋转 + 亚像素平移**：绕可配置锚点（相对坐标，默认中心）旋转，
+  逆映射双线性重采样在**预乘 alpha 空间**进行，越界邻居按全透明参与，
+  旋转空白角自然透明、半透明边缘无黑边；亚像素位移精确烘焙进采样坐标，
+  画布原点取整（floor 包围盒角点）不引入定位误差；
+- **逐帧蒙版**：自适应蒙版按当前帧的实际位置与旋转后尺寸实时重算；
+- **退化保证**：角度为 0 且位移为 0 时走快速路径，结果与静态叠加逐字节一致。
+
 ## 目录结构
 
 ```
@@ -57,10 +74,12 @@ watermark_overlay/
   interpolate.py  预乘空间双线性缩放与目标尺寸解析
   geometry.py     九宫格锚点定位
   mask.py         亮度/Sobel/积分图自适应蒙版
+  animation.py    关键帧轨迹、缓动函数、角度归一化、帧率映射
+  transform.py    预乘空间旋转 + 亚像素平移重采样
   config.py       WatermarkConfig 参数校验
-  engine.py       流水线编排（叠加主入口）
+  engine.py       流水线编排（静态/动画叠加主入口）
   cli.py          命令行入口
-tests/            87 项 pytest 测试
+tests/            160 项 pytest 测试
 demo/generate_demo.py
 ```
 
@@ -78,6 +97,25 @@ python -m watermark_overlay frame.png watermark.png -o out.png \
 # 启用内容自适应蒙版，关键区域自动降低水印可见度
 python -m watermark_overlay frame.png watermark.png -o out.png \
     --adaptive --mask-strength 0.8 --detail-low 16 --detail-high 96
+
+# 动画叠加：按 motion.json 的轨迹渲染第 12 帧（25fps → t=0.48s）
+python -m watermark_overlay frame.png watermark.png -o out.png \
+    --motion motion.json --frame-index 12 --fps 25
+```
+
+`motion.json` 示例（关键帧时间必须严格递增，x/y/angle 可省略）：
+
+```json
+{
+  "keyframes": [
+    {"time": 0.0, "x": 0, "y": 0, "angle": 0},
+    {"time": 1.0, "x": 40, "y": 10, "angle": 90},
+    {"time": 2.0, "x": 0, "y": 0, "angle": 360}
+  ],
+  "easing": "ease-in-out",
+  "anchor_x": 0.5,
+  "anchor_y": 0.5
+}
 ```
 
 作为库调用：
@@ -100,6 +138,32 @@ write_png("out.png", result)
 print(info.blended_pixels, info.origin)
 ```
 
+动画叠加（逐帧渲染，帧序列可循环调用）：
+
+```python
+from watermark_overlay import (
+    Keyframe, MotionConfig, WatermarkConfig,
+    overlay_animated_frame, read_png, write_png,
+)
+
+frame = read_png("frame.png")
+wm = read_png("watermark.png")
+motion = MotionConfig(
+    keyframes=[
+        Keyframe(0.0, x=0, y=0, angle=0),
+        Keyframe(2.0, x=40, y=10, angle=90),
+    ],
+    easing="ease-in-out",
+    anchor_x=0.5, anchor_y=0.5,  # 旋转锚点（相对水印尺寸）
+)
+config = WatermarkConfig(anchor="center", opacity=0.8)
+for n in range(50):  # 25fps 的 2 秒
+    out, info = overlay_animated_frame(
+        frame, wm, config, motion, frame_index=n, fps=25.0
+    )
+    write_png(f"frame_{n:03d}.png", out)
+```
+
 ## 参数与校验
 
 | 参数 | 范围/取值 | 说明 |
@@ -111,6 +175,11 @@ print(info.blended_pixels, info.origin)
 | `mask_strength` | [0.0, 1.0] | 关键区域最大压暗比例 |
 | `detail_low/high` | [0, 255] 且 low < high | 蒙版映射区间 |
 | `mask_radius` | ≥1 整数 | 局部统计窗口半径 |
+| `keyframes` | 时间严格递增，非空 | 运动轨迹关键帧（time/x/y/angle） |
+| `easing` | linear / ease-in / ease-out / ease-in-out | 段内缓动函数 |
+| `anchor_x/y`（运动） | [0.0, 1.0] | 旋转锚点相对坐标 |
+| `frame_index` | ≥0 整数 | 整数帧索引 |
+| `fps` | 正有限数（可非整数） | 帧率，t = frame_index / fps |
 
 所有非法参数（越界、类型错误、布尔冒充整数等）在进入算法前统一抛出
 `InvalidParameterError`；PNG 损坏/格式不支持抛出 `ImageDecodeError`；
@@ -122,13 +191,17 @@ CLI 捕获后输出中文错误并以退出码 2 结束。
 - 水印超帧尺寸或负原点：逐像素裁剪，仅帧内部分参与混合；
 - 完全无交集：正常写出原图并告警，混合像素数为 0；
 - 半透明目标帧：正确累积 alpha（`a_s + a_d - a_s·a_d/255`）；
-- 1px 图像、上/下采样、负采样坐标、越界 Sobel 邻居均有专门测试。
+- 1px 图像、上/下采样、负采样坐标、越界 Sobel 邻居均有专门测试；
+- 运动水印整体移出画布：零混合像素，帧保持不变；
+- 旋转越界：包围盒扩展 + 逐像素裁剪，空白角全透明；
+- 负角度 / 超 360°：归一化到 [0, 360)，450° 与 90° 结果逐字节一致；
+- 角度 0 + 位移 0：退化为静态叠加，结果与 `overlay_image` 逐字节一致。
 
 ## 测试与演示
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest          # 87 项测试
+python -m pytest          # 160 项测试
 python demo/generate_demo.py   # 生成固定/自适应/缩放三组对比 PNG
 ```
 

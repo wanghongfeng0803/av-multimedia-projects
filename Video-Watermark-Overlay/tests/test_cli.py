@@ -86,3 +86,58 @@ def test_cli_bad_detail_thresholds(tmp_path, capsys):
         [str(frame), str(wm), "-o", str(out), "--detail-low", "200", "--detail-high", "50"]
     )
     assert code == 2
+
+
+def test_cli_motion_json_success(tmp_path, capsys):
+    import json
+
+    frame, wm = _prepare_inputs(tmp_path)
+    motion = tmp_path / "motion.json"
+    motion.write_text(
+        json.dumps(
+            {
+                "keyframes": [
+                    {"time": 0, "x": 0, "y": 0, "angle": 0},
+                    {"time": 1, "x": 2, "y": 1, "angle": 90},
+                ],
+                "easing": "ease-in-out",
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.png"
+    code = main(
+        [
+            str(frame), str(wm), "-o", str(out),
+            "--motion", str(motion), "--frame-index", "12", "--fps", "24",
+        ]
+    )
+    assert code == 0
+    assert out.exists()
+    assert "角度" in capsys.readouterr().out
+
+
+def test_cli_motion_bad_json_returns_exit_2(tmp_path, capsys):
+    frame, wm = _prepare_inputs(tmp_path)
+    motion = tmp_path / "motion.json"
+    motion.write_text("{not json", encoding="utf-8")
+    out = tmp_path / "out.png"
+    code = main([str(frame), str(wm), "-o", str(out), "--motion", str(motion)])
+    assert code == 2
+    assert "错误" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_cli_motion_invalid_config_returns_exit_2(tmp_path, capsys):
+    import json
+
+    frame, wm = _prepare_inputs(tmp_path)
+    motion = tmp_path / "motion.json"
+    # 关键帧时间未递增，validate 应拒绝
+    motion.write_text(
+        json.dumps({"keyframes": [{"time": 2}, {"time": 1}]}), encoding="utf-8"
+    )
+    out = tmp_path / "out.png"
+    code = main([str(frame), str(wm), "-o", str(out), "--motion", str(motion)])
+    assert code == 2
+    assert not out.exists()

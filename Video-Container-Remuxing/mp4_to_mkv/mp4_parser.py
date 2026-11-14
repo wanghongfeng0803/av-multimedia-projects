@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from struct import unpack
 from typing import List, Optional, Tuple
 
+from .chapters import Chapter, extract_chapters
 from .errors import RemuxError
 
 # 支持的 sample entry 四字符码 → 编码族
@@ -196,6 +197,25 @@ def _parse_mdhd(mdhd: Box) -> Tuple[int, int]:
     if timescale <= 0:
         raise RemuxError("[mdhd] timescale 非法（必须为正整数）")
     return timescale, duration
+
+
+def _parse_mvhd_timescale(mvhd: Box) -> Optional[int]:
+    """读取 mvhd 的 movie timescale（chpl 章节时间戳的单位）。
+
+    与 mdhd 同构：FullBox 头之后，v0 布局为
+    creation(4)+modification(4)+timescale(4)+duration(4)，timescale 在
+    负载偏移 12；v1 两个时间字段各 8 字节，timescale 在负载偏移 20。
+    字段缺失或非法时返回 None，由章节提取层回退处理（不影响媒体解析）。
+    """
+    try:
+        version, _ = _parse_full_box_header(mvhd.data)
+        offset = 20 if version == 1 else 12
+        if len(mvhd.data) < offset + 4:
+            return None
+        timescale = unpack(">I", mvhd.data[offset:offset + 4])[0]
+    except RemuxError:
+        return None
+    return timescale if timescale > 0 else None
 
 
 def _parse_mdhd_language(mdhd: Box) -> str:
@@ -823,6 +843,9 @@ class Mp4File:
     def __init__(self, data: bytes):
         self._data = data
         self.tracks: List[Track] = []
+        # 章节（chpl）元数据与解析诊断；无章节时为空列表，不影响既有行为
+        self.chapters: List[Chapter] = []
+        self.chapter_warnings: List[str] = []
         self._parse()
 
     @property
@@ -858,6 +881,16 @@ class Mp4File:
             track = _parse_trak(trak, len(self._data))
             track.track_id = index
             self.tracks.append(track)
+
+        # 章节（chpl）属于附属元数据：解析全程不抛异常，损坏时只产生
+        # 诊断信息，绝不影响媒体轨道的主解析流程。
+        mvhd = next((b for b in moov.children() if b.kind == "mvhd"), None)
+        movie_timescale = (
+            _parse_mvhd_timescale(mvhd) if mvhd is not None else None
+        )
+        self.chapters, self.chapter_warnings = extract_chapters(
+            moov, movie_timescale
+        )
 
     @staticmethod
     def _contains_any(box: Box, targets: Tuple[str, ...]) -> bool:

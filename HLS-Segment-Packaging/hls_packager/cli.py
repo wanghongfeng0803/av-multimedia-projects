@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .encryption import DEFAULT_KEY_FILENAME, EncryptionConfig, EncryptionError
 from .errors import PackagerError
 from .packager import PLAYLIST_FILENAME, package
 from .watermark.config import VALID_ANCHORS, WatermarkConfig
@@ -108,12 +109,109 @@ def build_parser() -> argparse.ArgumentParser:
         default=24,
         help="水印距画面上下边缘的像素留白，默认 24",
     )
+
+    # ---- AES-128 分片加密（RFC 8216；不指定则分片保持明文） ----
+    enc = parser.add_argument_group("AES-128 分片加密")
+    enc.add_argument(
+        "--encrypt",
+        action="store_true",
+        help=(
+            "启用 AES-128-CBC 分片加密；未同时提供 --key-file/--key 时"
+            "自动生成随机密钥与随机 IV，并把 16 字节裸密钥写入输出目录"
+        ),
+    )
+    enc.add_argument(
+        "--key-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "密钥文件：16 字节原始二进制，或只含 32 位 hex / Base64 文本；"
+            "提供后即隐含启用加密"
+        ),
+    )
+    enc.add_argument(
+        "--key",
+        dest="key_text",
+        default=None,
+        metavar="KEY",
+        help=(
+            "直接传入密钥：32 位十六进制或 Base64 字符串（解码后须为 16 字节）；"
+            "提供后即隐含启用加密"
+        ),
+    )
+    enc.add_argument(
+        "--key-uri",
+        default=DEFAULT_KEY_FILENAME,
+        metavar="URI",
+        help=(
+            "EXT-X-KEY 的 URI 属性，默认 encryption.key（相对播放列表的"
+            "裸文件名）；可换成 https:// 等绝对地址"
+        ),
+    )
+    enc.add_argument(
+        "--iv",
+        dest="iv_text",
+        default=None,
+        metavar="IV",
+        help=(
+            "显式 IV：32 位十六进制（可带 0x 前缀）或 Base64；"
+            "不指定时，--encrypt/--key 自动生成随机 IV，"
+            "使用 --iv-mode sequence 时改为按分片序号隐式派生"
+        ),
+    )
+    enc.add_argument(
+        "--iv-mode",
+        choices=("random", "sequence"),
+        default="random",
+        help=(
+            "未显式给 --iv 时的 IV 策略：random（默认，随机显式 IV 并写入"
+            "播放列表）或 sequence（RFC §5.2 序号派生，播放列表不写 IV）"
+        ),
+    )
+
     parser.add_argument(
         "-y", "--overwrite",
         action="store_true",
         help="允许写入非空输出目录并覆盖同名产物",
     )
     return parser
+
+
+def _build_encryption_config(args) -> EncryptionConfig | None:
+    """根据 CLI 参数构造加密配置；未启用加密时返回 None（旧行为不变）。"""
+    if not (args.encrypt or args.key_file or args.key_text):
+        return None
+    if args.key_file and args.key_text:
+        raise EncryptionError("--key-file 与 --key 只能二选一，不能同时提供")
+
+    key_uri = args.key_uri
+    if args.key_file:
+        config = EncryptionConfig.from_key_file(
+            args.key_file, iv=args.iv_text, key_uri=key_uri
+        )
+    elif args.key_text:
+        config = EncryptionConfig.from_key(
+            args.key_text, iv=args.iv_text, key_uri=key_uri
+        )
+    else:
+        # 仅 --encrypt：现场生成密钥；IV 模式由 --iv-mode 决定
+        config = EncryptionConfig.generate(
+            key_uri=key_uri, random_iv=(args.iv_mode == "random")
+        )
+
+    # 显式 --iv 与 --iv-mode sequence 语义冲突，明确报错而不是静默覆盖
+    if args.iv_text is not None and args.iv_mode == "sequence":
+        raise EncryptionError(
+            "已显式传入 --iv 时不能再指定 --iv-mode sequence"
+            "（序号派生模式要求不提供 IV）"
+        )
+    if args.iv_text is None and args.key_file is None and args.key_text is None:
+        # 纯 --encrypt 分支已按 iv_mode 生成，无需后处理
+        return config
+    if args.iv_text is None and args.iv_mode == "sequence" and config.iv is not None:
+        # 理论上 from_key_file/from_key 在无 iv 时 iv 就是 None，这里只做防御
+        return EncryptionConfig(key=config.key, iv=None, key_uri=config.key_uri)
+    return config
 
 
 def _print_summary(result) -> None:

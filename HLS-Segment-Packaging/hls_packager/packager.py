@@ -24,6 +24,9 @@ import os
 from dataclasses import replace
 
 from .errors import PackagerError
+from .encryption.config import DEFAULT_KEY_FILENAME, EncryptionConfig
+from .encryption.key_info import KeyDescriptor
+from .encryption.segment_io import encrypt_segment_file, write_key_file
 from .m3u8 import PlaylistConfig, compute_target_duration, write_playlist
 from .models import MediaInfo, PackagingResult, SegmentInfo
 from .planner import plan_segments
@@ -62,8 +65,29 @@ def _write_metadata(
     target_duration: int,
     media_sequence: int,
     window_size: int | None,
+    encryption: EncryptionConfig | None = None,
 ) -> str:
     """落盘机器可读的分片元数据。"""
+    hls_block: dict = {
+        "version": 3,
+        "target_duration": target_duration,
+        "media_sequence": media_sequence,
+        "window_size": window_size,
+        "segment_count": len(segments),
+        "total_duration": round(sum(s.duration for s in segments), 6),
+    }
+    if encryption is not None:
+        # 记录加密方法、密钥 URI 与 IV 语义，便于下游核对播放列表；
+        # 密钥本身同时落盘为独立 .key 文件，这里只留其十六进制指纹
+        hls_block["encryption"] = {
+            "method": "AES-128",
+            "key_uri": encryption.key_uri,
+            "key_file": DEFAULT_KEY_FILENAME,
+            "key_hex": encryption.key_hex,
+            "iv_mode": "explicit" if encryption.iv is not None else "sequence",
+            "iv_hex": encryption.iv_hex,
+            "padding": "PKCS#7",
+        }
     payload = {
         "source": {
             "path": media.path,
@@ -75,14 +99,7 @@ def _write_metadata(
             "audio_codecs": [s.codec_name for s in media.audio_streams],
             "keyframe_count": len(media.keyframe_times),
         },
-        "hls": {
-            "version": 3,
-            "target_duration": target_duration,
-            "media_sequence": media_sequence,
-            "window_size": window_size,
-            "segment_count": len(segments),
-            "total_duration": round(sum(s.duration for s in segments), 6),
-        },
+        "hls": hls_block,
         "segments": [
             {
                 "sequence_number": seg.sequence_number,
@@ -111,8 +128,9 @@ def package(
     filename_prefix: str = "seg",
     overwrite: bool = False,
     watermark: WatermarkConfig | None = None,
+    encryption: EncryptionConfig | None = None,
 ) -> PackagingResult:
-    """把一个媒体文件打包为 HLS（MPEG-TS 分片 + M3U8）。
+    """把一个媒体文件打包为 HLS（MPEG-TS 分片 + M3U8），可选 AES-128 加密。
 
     :param input_path: 源文件路径；
     :param output_dir: 输出目录（不存在则创建）；
@@ -122,7 +140,10 @@ def package(
     :param overwrite: 输出目录非空时是否允许写入（会覆盖同名产物）；
     :param watermark: 文字水印配置；``None`` 时全程流拷贝、行为与
         旧版本完全一致；传入时视频轨重编码叠加水印，音频仍流拷贝。
-    :raises PackagerError: 任意可预期的输入/环境/切片错误。
+    :param encryption: AES-128 加密配置；``None`` 时不加密、行为与
+        旧版本完全一致；传入时切片复测通过后逐片做 AES-128-CBC 加密，
+        密钥写入输出目录、播放列表增加 EXT-X-KEY 标签。
+    :raises PackagerError: 任意可预期的输入/环境/切片/加密错误。
     """
     if target_duration <= 0:
         raise PackagerError(f"目标分片时长必须为正数，实际为 {target_duration!r}")
@@ -130,6 +151,8 @@ def package(
         raise PackagerError("MEDIA-SEQUENCE 起始序号不能为负数")
     if watermark is not None:
         watermark.validate()
+    if encryption is not None:
+        encryption.validate()
 
     os.makedirs(output_dir, exist_ok=True)
     if not overwrite and os.listdir(output_dir):
@@ -169,11 +192,25 @@ def package(
     # 5) 实测时长重建连续时间轴
     segments = _rebuild_timeline(planned, actual_durations)
 
+    # 5.5) 可选 AES-128-CBC 加密：复测全部通过后才加密，保证写入磁盘的
+    #      时长数据来自明文分片；逐片原子替换，密钥与 EXT-X-KEY 同步产出
+    key_descriptor = None
+    if encryption is not None:
+        key_path = write_key_file(encryption, output_dir)
+        for seg in segments:
+            encrypt_segment_file(
+                os.path.join(output_dir, seg.filename),
+                encryption,
+                seg.sequence_number,
+            )
+        key_descriptor = KeyDescriptor.from_encryption_config(encryption)
+
     # 6) 播放列表（TARGETDURATION 按实测最大片长向上取整）
     target = compute_target_duration(segments)
     config = PlaylistConfig(
         target_duration=target,
         window_size=window_size,
+        key=key_descriptor,
     )
     playlist_path = write_playlist(
         segments,
@@ -183,7 +220,8 @@ def package(
 
     # 7) 元数据
     metadata_path = _write_metadata(
-        output_dir, media, segments, target, media_sequence, window_size
+        output_dir, media, segments, target, media_sequence, window_size,
+        encryption,
     )
 
     extra = {"metadata_path": metadata_path}
@@ -191,6 +229,15 @@ def package(
         extra["watermark_png"] = os.path.abspath(
             os.path.join(output_dir, WATERMARK_PNG_FILENAME)
         )
+    if encryption is not None:
+        extra["encryption"] = {
+            "method": "AES-128",
+            "key_file": os.path.abspath(key_path),
+            "key_uri": encryption.key_uri,
+            "key_hex": encryption.key_hex,
+            "iv_mode": "explicit" if encryption.iv is not None else "sequence",
+            "iv_hex": encryption.iv_hex,
+        }
 
     return PackagingResult(
         output_dir=os.path.abspath(output_dir),

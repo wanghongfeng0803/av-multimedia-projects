@@ -18,6 +18,13 @@ from typing import Callable
 
 from . import capabilities, segments
 from .binaries import find_ffmpeg
+from .bitrate import (
+    BitratePlan,
+    MODE_VBR,
+    RATE_MODES,
+    build_bitrate_encoder_args,
+    plan_bitrate,
+)
 from .codecs import (
     CodecSpec,
     EncoderSpec,
@@ -44,11 +51,13 @@ from .errors import (
 from .models import MediaInfo, StreamInfo, TranscodeResult
 from .probe import probe_media
 from .runner import build_progress_args, run_ffmpeg
+from .scale import ResolutionPlan, parse_resolution
 
 # 进度回调：参数为 0.0-1.0 的完成比例
 ProgressCallback = Callable[[float], None]
 
-# yuv420p 要求宽高均为偶数；不规范的奇数尺寸用此滤镜向下取整并保持宽高比
+# 以下两个滤镜为历史实现逐字保留，无分辨率请求时仍走这条路径：
+# yuv420p 要求宽高均为偶数；奇数尺寸用此滤镜向下取整并保持宽高比
 _EVEN_DIM_FILTER = "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,setsar=1"
 # 非 yuv420p 像素格式（含 10bit、RGB 等）统一转换，保证最大播放器兼容性
 _PIX_FMT_FILTER = (
@@ -71,6 +80,10 @@ def transcode(
     segment_duration: float | None = None,
     segment_count: int | None = None,
     progress_callback: ProgressCallback | None = None,
+    target_bitrate: str | int | float | None = None,
+    rate_mode: str = MODE_VBR,
+    resolution: str | None = None,
+    allow_upscale: bool = False,
 ) -> TranscodeResult:
     """将输入视频转码为指定编码/容器的媒体文件。
 
@@ -78,7 +91,8 @@ def transcode(
     :param output_path: 输出路径；为 None 时在输入旁生成
         ``<名>_<编码>.<容器扩展名>``
     :param crf: 质量参数；None 时使用该编码的默认值。范围随编码不同
-        （H.264/H.265: 0-51，VP9/AV1: 0-63，VP8: 4-63）
+        （H.264/H.265: 0-51，VP9/AV1: 0-63，VP8: 4-63）。
+        与 ``target_bitrate`` 互斥
     :param preset: 速度档位，支持十档命名或编码器原生数字档位
     :param overwrite: 输出已存在时是否覆盖
     :param audio_bitrate: 音频需要重编码时使用的码率
@@ -87,15 +101,34 @@ def transcode(
     :param segment_duration: 大文件分段时长（秒），与 segment_count 二选一
     :param segment_count: 大文件分段数量，segment_duration 优先
     :param progress_callback: 进度回调，接收 0.0-1.0 且单调不减的完成比例
+    :param target_bitrate: 目标视频码率（如 ``"2M"``/``"800k"``/整数 bps）。
+        给定后改走码率控制路线，忽略 ``crf``；为 None 时保持 CRF 常量质量
+    :param rate_mode: 码率控制模式 ``vbr``/``abr``/``cbr``，仅在指定
+        ``target_bitrate`` 时生效
+    :param resolution: 输出分辨率表达式（``"1920x1080"``/``"1280"``/
+        ``"x720"``/``"50%"``/``"1080p"`` 等）；None 时保持源分辨率
+    :param allow_upscale: 是否允许把源放大到更大分辨率，默认 False
     :returns: :class:`TranscodeResult` 结果摘要
     :raises: :mod:`transcode_tool.errors` 中定义的各类 TranscodeError
     """
     codec_spec = _coerce_codec(codec)
-    if crf is None:
-        crf = codec_spec.default_crf
+    if target_bitrate is not None:
+        # 码率路线与 CRF 路线互斥：两者同给属于调用方意图冲突，明确报错，
+        # 而不是静默二选一
+        if crf is not None:
+            raise ValueError("crf 与 target_bitrate 互斥，请只指定一种质量控制方式。")
+        if rate_mode not in RATE_MODES:
+            raise ValueError(
+                f"rate_mode 必须是 {', '.join(RATE_MODES)} 之一，收到 {rate_mode!r}。"
+            )
+        bitrate_plan: BitratePlan | None = plan_bitrate(target_bitrate, rate_mode)
+    else:
+        bitrate_plan = None
+        if crf is None:
+            crf = codec_spec.default_crf
+        validate_crf(codec_spec, crf)
     if preset is None:
         preset = codec_spec.default_preset
-    validate_crf(codec_spec, crf)
     validate_preset(codec_spec, preset)
     if not isinstance(audio_bitrate, str) or not audio_bitrate.strip():
         raise ValueError("audio_bitrate 必须是非空字符串，如 '128k'。")
@@ -127,6 +160,12 @@ def transcode(
     video_encoder = capabilities.select_video_encoder(codec_spec, ffmpeg_path)
 
     warnings = list(info.warnings)
+
+    # 分辨率规划（可选）：无请求时为 None，滤镜走历史逻辑，行为完全不变
+    resolution_plan = _plan_resolution(
+        resolution, video, allow_upscale, warnings
+    )
+
     plan = segments.plan_segments(
         info.duration_seconds,
         segment_duration=segment_duration,
@@ -143,12 +182,14 @@ def transcode(
                 input_path, output_path, info, video, codec_spec, video_encoder,
                 container_spec, crf, preset, audio_bitrate, overwrite,
                 log_path, warnings, progress_callback, ffmpeg_path,
+                bitrate_plan, resolution_plan,
             )
         else:
             _run_segmented(
                 input_path, output_path, info, video, codec_spec, video_encoder,
                 container_spec, crf, preset, audio_bitrate, overwrite,
                 log_path, warnings, progress_callback, ffmpeg_path, plan,
+                bitrate_plan, resolution_plan,
             )
     except FFmpegRunError as exc:
         # runner 已把 stderr 流式写入 log_path；异常未携带日志内容时补写，
@@ -173,6 +214,9 @@ def transcode(
     result.warnings = warnings + result.warnings
     result.container = container_spec.canonical
     result.encoder = video_encoder.name
+    if bitrate_plan is not None:
+        result.target_bitrate_bps = bitrate_plan.target_bps
+        result.rate_mode = bitrate_plan.mode
     if not os.path.exists(log_path):
         result.ffmpeg_log_path = None
     return result
@@ -186,6 +230,7 @@ def _run_single(
     input_path, output_path, info, video, codec_spec, video_encoder,
     container_spec, crf, preset, audio_bitrate, overwrite,
     log_path, warnings, progress_callback, ffmpeg_path,
+    bitrate_plan, resolution_plan,
 ) -> None:
     cmd = _build_command(
         input_path=input_path,
@@ -203,6 +248,8 @@ def _run_single(
         ffmpeg_path=ffmpeg_path,
         seek=None,
         duration=None,
+        bitrate_plan=bitrate_plan,
+        resolution_plan=resolution_plan,
     )
     returncode, stderr_tail = run_ffmpeg(
         cmd,
@@ -226,6 +273,7 @@ def _run_segmented(
     input_path, output_path, info, video, codec_spec, video_encoder,
     container_spec, crf, preset, audio_bitrate, overwrite,
     log_path, warnings, progress_callback, ffmpeg_path, plan,
+    bitrate_plan, resolution_plan,
 ) -> None:
     workdir = segments.make_temp_workdir()
     segment_paths: list[str] = []
@@ -254,6 +302,8 @@ def _run_segmented(
                 ffmpeg_path=ffmpeg_path,
                 seek=segment.start,
                 duration=segment.duration,
+                bitrate_plan=bitrate_plan,
+                resolution_plan=resolution_plan,
             )
             returncode, stderr_tail = run_ffmpeg(
                 cmd,
@@ -298,7 +348,7 @@ def _build_command(
     codec: CodecSpec,
     video_encoder: EncoderSpec,
     container: ContainerSpec,
-    crf: int,
+    crf: int | None,
     preset: str,
     audio_bitrate: str,
     overwrite: bool,
@@ -306,6 +356,8 @@ def _build_command(
     ffmpeg_path: str,
     seek: float | None,
     duration: float | None,
+    bitrate_plan: BitratePlan | None,
+    resolution_plan: ResolutionPlan | None,
 ) -> list[str]:
     cmd: list[str] = [
         ffmpeg_path, "-hide_banner", "-nostdin",
@@ -353,14 +405,22 @@ def _build_command(
                 f"已丢弃 {dropped} 条额外流（多余音轨/字幕/数据流等）。"
             )
 
-    vf, video_warnings = _video_filter(video, codec)
+    vf, video_warnings = _video_filter(video, codec, resolution_plan)
     if seek is None:
         warnings.extend(video_warnings)
     if vf:
         cmd += ["-vf", vf]
 
     cmd += ["-c:v", video_encoder.name]
-    cmd += build_video_encoder_args(codec, video_encoder, crf, preset)
+    if bitrate_plan is None:
+        # CRF 常量质量路线（历史默认行为）
+        cmd += build_video_encoder_args(codec, video_encoder, crf, preset)
+    else:
+        # 目标码率路线：按编码器分别生成真实可用的码控参数，不再传 -crf
+        cmd += build_bitrate_encoder_args(
+            codec, video_encoder, bitrate_plan, preset,
+            container_canonical=container.canonical,
+        )
     cmd += ["-pix_fmt", _TARGET_PIX_FMT]
 
     # MP4 系容器前置 moov atom 便于网络播放；分段临时文件也保持一致
@@ -400,28 +460,69 @@ def _audio_args(
     return ["-c:a", chosen, "-b:a", audio_bitrate]
 
 
+def _plan_resolution(
+    resolution: str | None,
+    video: StreamInfo,
+    allow_upscale: bool,
+    warnings: list[str],
+) -> ResolutionPlan | None:
+    """把可选的分辨率表达式解析为具体尺寸规划，并把告警并入主告警列表。"""
+    if resolution is None:
+        return None
+    width, height = video.width or 0, video.height or 0
+    if width <= 0 or height <= 0:
+        # 探测不到尺寸时无法做等比规划：明确报错而非产生不可控输出
+        raise InvalidInputError(
+            "无法从输入探测到视频尺寸，不能应用目标分辨率参数。"
+        )
+    plan = parse_resolution(resolution, width, height, allow_upscale=allow_upscale)
+    warnings.extend(plan.warnings)
+    return plan
+
+
 def _video_filter(
-    video: StreamInfo, codec: CodecSpec
+    video: StreamInfo,
+    codec: CodecSpec,
+    resolution_plan: ResolutionPlan | None,
 ) -> tuple[str, list[str]]:
-    """根据源视频像素格式与尺寸决定视频滤镜。"""
+    """根据源像素格式/尺寸与可选分辨率规划决定视频滤镜。
+
+    两条分支：
+      - 无分辨率请求：**完全复刻历史滤镜字符串与告警**，保证旧行为不退化；
+      - 有分辨率请求：三段式管线「显式缩放 →（可选）像素格式归一化 →
+        setsar=1」，目标尺寸已在 Python 侧保证偶数并保持宽高比。
+    """
     warnings: list[str] = []
     width, height = video.width or 0, video.height or 0
     odd = bool(width and height and (width % 2 or height % 2))
 
-    if odd:
+    if odd and resolution_plan is None:
         warnings.append(
             f"源视频尺寸 {width}x{height} 含奇数像素，已向下取整为偶数尺寸"
             f"以适配 {codec.canonical}（yuv420p 要求偶数宽高）。"
         )
+    if video.pix_fmt and video.pix_fmt not in {"yuv420p", "yuvj420p"} \
+            and resolution_plan is None:
+        warnings.append(
+            f"源像素格式 {video.pix_fmt} 已转换为 {_TARGET_PIX_FMT}（通用兼容格式）。"
+        )
 
-    if video.pix_fmt == "yuv420p":
-        return (_EVEN_DIM_FILTER if odd else "", warnings)
+    # --- 分支一：历史路径，滤镜字符串逐字保持 ---
+    if resolution_plan is None:
+        if video.pix_fmt == "yuv420p":
+            return (_EVEN_DIM_FILTER if odd else "", warnings)
+        return _PIX_FMT_FILTER, warnings
 
+    # --- 分支二：目标分辨率路径 ---
     if video.pix_fmt and video.pix_fmt not in {"yuv420p", "yuvj420p"}:
         warnings.append(
             f"源像素格式 {video.pix_fmt} 已转换为 {_TARGET_PIX_FMT}（通用兼容格式）。"
         )
-    return _PIX_FMT_FILTER, warnings
+    chain = [resolution_plan.scale_filter]
+    if video.pix_fmt not in {"yuv420p", "yuvj420p"}:
+        chain.append(f"format={_TARGET_PIX_FMT}")
+    chain.append("setsar=1")
+    return ",".join(chain), warnings
 
 
 # ---------------------------------------------------------------------------

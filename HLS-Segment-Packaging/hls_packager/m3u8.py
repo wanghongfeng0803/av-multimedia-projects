@@ -15,7 +15,10 @@
 * ``EXTINF``：保留 3 位小数的浮点秒，逗号后不写可选标题；
 * ``EXT-X-MEDIA-SEQUENCE``：窗口首片的绝对分片序号；
 * ``EXT-X-INDEPENDENT-SEGMENTS``：声明每片均可独立解码
-  （本工具切点全部对齐 IDR，满足该承诺）。
+  （本工具切点全部对齐 IDR，满足该承诺）；
+* ``EXT-X-KEY``（可选）：``METHOD=AES-128`` 加密声明，放在首个
+  ``EXTINF`` 之前、对全部分片生效；不带加密配置时不输出该标签，
+  渲染结果与旧版本逐字节一致。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .encryption.key_info import KeyDescriptor, render_key_tag
 from .errors import PlaylistError
 from .models import SegmentInfo
 
@@ -47,6 +51,8 @@ class PlaylistConfig:
     window_size: int | None = None
     playlist_type: str = "VOD"
     independent_segments: bool = True
+    #: AES-128 密钥描述；None 表示不加密（不输出 EXT-X-KEY，行为同旧版）
+    key: KeyDescriptor | None = None
 
 
 def compute_target_duration(segments: list[SegmentInfo]) -> int:
@@ -117,6 +123,10 @@ def render_playlist(
     is_vod = config.window_size is None
     if is_vod:
         lines.append(f"#EXT-X-PLAYLIST-TYPE:{config.playlist_type}")
+
+    # RFC 8216 §4.3.2.4：KEY 标签作用于其后的全部分片，放在首个 EXTINF 之前
+    if config.key is not None:
+        lines.append(render_key_tag(config.key))
 
     for seg in window:
         lines.append(f"#EXTINF:{seg.duration:.{_EXTINF_PRECISION}f},")

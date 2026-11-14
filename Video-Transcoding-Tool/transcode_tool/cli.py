@@ -59,6 +59,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--audio-bitrate", default="128k",
         help="音频需重编码时的码率（默认 128k）",
     )
+    parser.add_argument(
+        "--bitrate", default=None, metavar="RATE",
+        help="目标视频码率，如 800k / 2M / 1500000；给定后按码率编码并忽略 --crf",
+    )
+    parser.add_argument(
+        "--rate-mode", choices=["vbr", "abr", "cbr"], default="vbr",
+        help="码率控制模式（仅配合 --bitrate）：vbr 可变(默认) / abr 平均 / cbr 恒定",
+    )
+    parser.add_argument(
+        "--resolution", default=None, metavar="SPEC",
+        help="输出分辨率：1920x1080 / 1280(定宽) / x720(定高) / 50%% / 720p、1080p、4k 等",
+    )
+    parser.add_argument(
+        "--allow-upscale", action="store_true",
+        help="允许把源放大到更大分辨率（默认禁止放大，超过源的请求会收敛回源尺寸）",
+    )
     segment = parser.add_mutually_exclusive_group()
     segment.add_argument(
         "--segment-duration", type=float, default=None, metavar="SECONDS",
@@ -136,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
             segment_duration=args.segment_duration,
             segment_count=args.segment_count,
             progress_callback=progress_callback,
+            target_bitrate=args.bitrate,
+            rate_mode=args.rate_mode,
+            resolution=args.resolution,
+            allow_upscale=args.allow_upscale,
         )
     except ContainerError as exc:
         # 容器/编码组合不兼容属于参数层面的错误，退出码 1
@@ -231,6 +251,13 @@ def _print_human_readable(result) -> None:
         f"  视频编码: {result.video_codec}{container}{encoder} "
         f"({result.width}x{result.height})"
     )
+    if result.target_bitrate_bps:
+        from .bitrate import format_bitrate
+
+        print(
+            f"  目标码率: {format_bitrate(result.target_bitrate_bps)}"
+            f"（{result.rate_mode or 'vbr'} 模式）"
+        )
     print(f"  音频编码: {result.audio_codec or '无音频'}")
     if result.duration_seconds is not None:
         print(f"  时长: {result.duration_seconds:.2f} 秒")
