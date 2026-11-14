@@ -18,12 +18,20 @@ from .errors import (
     ProbeError,
     SegmenterError,
     UnsupportedInputError,
+    WatermarkError,
 )
 from .m3u8 import PlaylistConfig, compute_target_duration, render_playlist
 from .models import MediaInfo, PackagingResult, SegmentInfo, StreamInfo
 from .packager import package
 from .planner import plan_segments
 from .probe import probe_media
+from .watermark import (
+    WatermarkConfig,
+    build_watermarked_segment_command,
+    decode_utf8,
+    escape_filter_path,
+    render_text_png,
+)
 
 __all__ = [
     "package",
@@ -42,6 +50,12 @@ __all__ = [
     "UnsupportedInputError",
     "SegmenterError",
     "PlaylistError",
+    "WatermarkError",
+    "WatermarkConfig",
+    "render_text_png",
+    "decode_utf8",
+    "escape_filter_path",
+    "build_watermarked_segment_command",
 ]
 
 __version__ = "1.0.0"

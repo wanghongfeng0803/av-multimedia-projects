@@ -7,6 +7,7 @@ import sys
 
 from .errors import PackagerError
 from .packager import PLAYLIST_FILENAME, package
+from .watermark.config import VALID_ANCHORS, WatermarkConfig
 
 EXIT_OK = 0
 EXIT_PACKAGER_ERROR = 2
@@ -54,6 +55,59 @@ def build_parser() -> argparse.ArgumentParser:
         default="seg",
         help="分片文件名前缀，默认 seg（产出 seg_0000.ts ...）",
     )
+
+    # ---- 文字水印（自行栅格化后重编码视频轨叠加；不指定则保持流拷贝） ----
+    wm = parser.add_argument_group("文字水印")
+    wm.add_argument(
+        "--watermark-text",
+        default=None,
+        help=(
+            "水印文字（UTF-8，支持多字节与特殊字符）；不指定则不叠加水印，"
+            "保持流拷贝行为不变"
+        ),
+    )
+    wm.add_argument(
+        "--watermark-font",
+        action="append",
+        default=None,
+        metavar="FONT_PATH",
+        help="显式字体文件，可重复传入按顺序回退；缺省时自动发现系统字体",
+    )
+    wm.add_argument(
+        "--watermark-size",
+        type=int,
+        default=28,
+        help="水印字号（像素），默认 28",
+    )
+    wm.add_argument(
+        "--watermark-color",
+        default="white",
+        help="文字颜色：#RGB / #RRGGBB / 命名色，默认 white",
+    )
+    wm.add_argument(
+        "--watermark-opacity",
+        type=float,
+        default=1.0,
+        help="不透明度 0.0~1.0，默认 1.0",
+    )
+    wm.add_argument(
+        "--watermark-anchor",
+        default="bottom-right",
+        choices=VALID_ANCHORS,
+        help="九宫格锚点，默认 bottom-right",
+    )
+    wm.add_argument(
+        "--watermark-margin-x",
+        type=int,
+        default=24,
+        help="水印距画面左右边缘的像素留白，默认 24",
+    )
+    wm.add_argument(
+        "--watermark-margin-y",
+        type=int,
+        default=24,
+        help="水印距画面上下边缘的像素留白，默认 24",
+    )
     parser.add_argument(
         "-y", "--overwrite",
         action="store_true",
@@ -82,6 +136,8 @@ def _print_summary(result) -> None:
             else "VOD（含 ENDLIST）"
         )
     )
+    if result.extra.get("watermark_png"):
+        print(f"  文字水印   : {result.extra['watermark_png']}")
     print("  分片明细（前 5 片）:")
     for seg in segments[:5]:
         print(
@@ -97,6 +153,18 @@ def main(argv: list[str] | None = None) -> int:
     _force_utf8_console()
     args = build_parser().parse_args(argv)
     try:
+        watermark = None
+        if args.watermark_text is not None:
+            watermark = WatermarkConfig(
+                text=args.watermark_text,
+                font_files=tuple(args.watermark_font or ()),
+                font_size=args.watermark_size,
+                color=args.watermark_color,
+                opacity=args.watermark_opacity,
+                anchor=args.watermark_anchor,
+                margin_x=args.watermark_margin_x,
+                margin_y=args.watermark_margin_y,
+            )
         result = package(
             input_path=args.input,
             output_dir=args.output_dir,
@@ -105,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             media_sequence=args.media_sequence,
             filename_prefix=args.filename_prefix,
             overwrite=args.overwrite,
+            watermark=watermark,
         )
     except PackagerError as exc:
         # 可预期的输入/环境/切片问题：明确中文提示 + 非零退出码

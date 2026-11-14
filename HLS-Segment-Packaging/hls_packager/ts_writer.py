@@ -31,6 +31,9 @@ from .binaries import ffprobe_path, ffmpeg_path
 from .errors import SegmenterError, UnsupportedInputError
 from .models import MediaInfo, SegmentInfo
 from .process import run_capture
+from .watermark.config import WatermarkConfig
+from .watermark.overlay import build_watermarked_segment_command
+from .watermark.rasterize import render_text_png
 
 # MPEG-TS 支持的编码白名单（ffmpeg mpegts muxer 可直接承载的常见编码）
 _TS_VIDEO_CODECS = {"h264", "hevc", "mpeg2video", "mpeg1video", "mp4"}
@@ -41,6 +44,9 @@ _TIMEOUT_BASE = 60.0
 _TIMEOUT_PER_SECOND = 10.0
 # Windows CreateProcess 命令行上限约 32767 字符，预留安全余量
 _ARGV_SOFT_LIMIT = 30000
+
+#: 水印位图在输出目录中的临时文件名
+WATERMARK_PNG_FILENAME = ".watermark_text.png"
 
 
 @dataclass(frozen=True)
@@ -168,17 +174,32 @@ def write_all_segments(
     output_dir: str,
     filename_prefix: str,
     maps: list[str],
+    watermark: WatermarkConfig | None = None,
 ) -> list[WrittenSegment]:
     """一次性切出全部分片，并逐片复测实际时长与文件大小。
 
     依赖 segment muxer 的输出序号与规划序号一一对应（文件名均可由
     :attr:`SegmentInfo.filename` 直接定位），逐片校验存在性与时长。
+
+    传入 :class:`WatermarkConfig` 时切换到"重编码视频 + overlay 水印"
+    分支：先自行栅格化文字为 PNG，再走带 ``-force_key_frames`` 的
+    重编码 segment 命令；为 ``None`` 时与历史行为完全一致（流拷贝）。
     """
-    argv = build_segmentation_command(
-        media, planned, output_dir, filename_prefix, maps
-    )
-    # 处理整文件，超时按源时长估算
-    timeout = _TIMEOUT_BASE + media.duration * _TIMEOUT_PER_SECOND
+    if watermark is None:
+        argv = build_segmentation_command(
+            media, planned, output_dir, filename_prefix, maps
+        )
+    else:
+        watermark_png = os.path.join(output_dir, WATERMARK_PNG_FILENAME)
+        render_text_png(watermark, watermark_png)
+        argv = build_watermarked_segment_command(
+            media, planned, output_dir, filename_prefix, maps,
+            watermark_png, watermark,
+        )
+
+    # 整文件处理，超时按源时长估算（重编码比流拷贝慢，水印分支放宽 3 倍）
+    factor = _TIMEOUT_PER_SECOND * (3.0 if watermark is not None else 1.0)
+    timeout = _TIMEOUT_BASE + media.duration * factor
 
     result = run_capture(argv, timeout=timeout)
     if not result.ok:

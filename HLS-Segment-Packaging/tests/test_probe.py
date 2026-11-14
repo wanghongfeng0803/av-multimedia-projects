@@ -43,7 +43,7 @@ def test_parse_streams_video_audio_fields(monkeypatch):
             },
         ],
     }
-    probe_mod.run_capture = lambda *a, **k: _ok(payload)
+    monkeypatch.setattr(probe_mod, "run_capture", lambda *a, **k: _ok(payload))
     media = probe_mod.probe_media("X:/in.mp4")
 
     assert media.duration == pytest.approx(12.5)
@@ -57,7 +57,7 @@ def test_parse_streams_video_audio_fields(monkeypatch):
     assert media.has_video and len(media.audio_streams) == 1
 
 
-def test_keyframe_times_from_packets():
+def test_keyframe_times_from_packets(monkeypatch):
     packet_payload = {
         "packets": [
             {"pts_time": "0.000000", "flags": "K__"},
@@ -66,12 +66,12 @@ def test_keyframe_times_from_packets():
             {"pts_time": "4.000000", "flags": "K__"},
         ]
     }
-    probe_mod.run_capture = lambda *a, **k: _ok(packet_payload)
+    monkeypatch.setattr(probe_mod, "run_capture", lambda *a, **k: _ok(packet_payload))
     times = probe_mod.extract_keyframe_times("X:/in.mp4", 0)
     assert times == (0.0, 2.0, 4.0)
 
 
-def test_keyframe_fallback_to_frames_when_packets_empty():
+def test_keyframe_fallback_to_frames_when_packets_empty(monkeypatch):
     # 第一次调用（packets）返回空，第二次（frames）返回 I 帧
     payloads = [
         {"packets": []},
@@ -88,13 +88,13 @@ def test_keyframe_fallback_to_frames_when_packets_empty():
         calls["n"] += 1
         return result
 
-    probe_mod.run_capture = fake_run
+    monkeypatch.setattr(probe_mod, "run_capture", fake_run)
     times = probe_mod.extract_keyframe_times("X:/in.ts", 0)
     assert times == (0.0, 1.0)
     assert calls["n"] == 2  # 确实触发了回退
 
 
-def test_keyframe_dedup_and_sort():
+def test_keyframe_dedup_and_sort(monkeypatch):
     # 乱序 + 近似重复
     payload = {"packets": [
         {"pts_time": "4.0", "flags": "K__"},
@@ -102,7 +102,7 @@ def test_keyframe_dedup_and_sort():
         {"pts_time": "4.0000001", "flags": "K__"},
         {"pts_time": "2.0", "flags": "K__"},
     ]}
-    probe_mod.run_capture = lambda *a, **k: _ok(payload)
+    monkeypatch.setattr(probe_mod, "run_capture", lambda *a, **k: _ok(payload))
     times = probe_mod.extract_keyframe_times("X:/in.mp4", 0)
     assert times == (0.0, 2.0, 4.0)
 

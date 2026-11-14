@@ -28,7 +28,8 @@ from .m3u8 import PlaylistConfig, compute_target_duration, write_playlist
 from .models import MediaInfo, PackagingResult, SegmentInfo
 from .planner import plan_segments
 from .probe import probe_media
-from .ts_writer import validate_codecs, write_all_segments
+from .ts_writer import WATERMARK_PNG_FILENAME, validate_codecs, write_all_segments
+from .watermark.config import WatermarkConfig
 
 #: 元数据文件名
 METADATA_FILENAME = "segments.json"
@@ -109,6 +110,7 @@ def package(
     media_sequence: int = 0,
     filename_prefix: str = "seg",
     overwrite: bool = False,
+    watermark: WatermarkConfig | None = None,
 ) -> PackagingResult:
     """把一个媒体文件打包为 HLS（MPEG-TS 分片 + M3U8）。
 
@@ -117,13 +119,17 @@ def package(
     :param target_duration: 目标分片时长（秒），实际切点对齐 GOP；
     :param window_size: 直播滑动窗口大小；``None`` 表示 VOD 全量列表；
     :param media_sequence: 首片的 EXT-X-MEDIA-SEQUENCE 序号；
-    :param overwrite: 输出目录非空时是否允许写入（会覆盖同名产物）。
+    :param overwrite: 输出目录非空时是否允许写入（会覆盖同名产物）；
+    :param watermark: 文字水印配置；``None`` 时全程流拷贝、行为与
+        旧版本完全一致；传入时视频轨重编码叠加水印，音频仍流拷贝。
     :raises PackagerError: 任意可预期的输入/环境/切片错误。
     """
     if target_duration <= 0:
         raise PackagerError(f"目标分片时长必须为正数，实际为 {target_duration!r}")
     if media_sequence < 0:
         raise PackagerError("MEDIA-SEQUENCE 起始序号不能为负数")
+    if watermark is not None:
+        watermark.validate()
 
     os.makedirs(output_dir, exist_ok=True)
     if not overwrite and os.listdir(output_dir):
@@ -149,12 +155,14 @@ def package(
     maps = validate_codecs(media)
 
     # 4) 一次性切出全部分片，并逐片复测实际时长
+    #    （watermark=None 走流拷贝旧路径；否则自行栅格化文字后重编码叠加）
     written_segments = write_all_segments(
         media=media,
         planned=planned,
         output_dir=output_dir,
         filename_prefix=filename_prefix,
         maps=maps,
+        watermark=watermark,
     )
     actual_durations = [w.actual_duration for w in written_segments]
 
@@ -178,6 +186,12 @@ def package(
         output_dir, media, segments, target, media_sequence, window_size
     )
 
+    extra = {"metadata_path": metadata_path}
+    if watermark is not None:
+        extra["watermark_png"] = os.path.abspath(
+            os.path.join(output_dir, WATERMARK_PNG_FILENAME)
+        )
+
     return PackagingResult(
         output_dir=os.path.abspath(output_dir),
         playlist_path=os.path.abspath(playlist_path),
@@ -186,5 +200,5 @@ def package(
         target_duration=target,
         media_sequence=media_sequence,
         window_size=window_size,
-        extra={"metadata_path": metadata_path},
+        extra=extra,
     )

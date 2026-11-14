@@ -20,6 +20,11 @@
   开销接近纯 IO；关键帧探测优先走只解复用的包级查询。
 - **元数据落盘**：`segments.json` 记录每片的源内起点、输出时间轴起点、
   实测时长、序号，便于下游核对。
+- **文字水印（可选）**：完全自研文字栅格化——手写 UTF-8 解码器、
+  TrueType（.ttf/.ttc）解析器、扫描线超采样抗锯齿与 PNG 编码，零第三方
+  依赖；自带 5x7 点阵字体作为字体全部缺失时的最终回退。叠加走
+  `overlay` 过滤器，参数全部以独立 argv 传递、路径不进 filtergraph，
+  杜绝注入；不指定水印时行为与纯流拷贝版本完全一致。
 - **零第三方 Python 依赖**：仅用标准库，外部只依赖系统 `ffmpeg`/`ffprobe`。
 
 ## 目录结构
@@ -29,16 +34,27 @@ hls_packager/
 ├── __init__.py      # 公开 API
 ├── __main__.py      # python -m hls_packager 入口
 ├── cli.py           # argparse 命令行
-├── errors.py        # 异常体系（环境/探测/切片/播放列表）
+├── errors.py        # 异常体系（环境/探测/切片/播放列表/水印）
 ├── binaries.py      # ffmpeg / ffprobe 可执行文件发现
 ├── process.py       # 子进程执行封装
 ├── models.py        # 不可变数据模型（StreamInfo/MediaInfo/SegmentInfo...）
 ├── probe.py         # ffprobe 探测 + 关键帧时间序列提取
 ├── planner.py       # GOP 对齐分片规划（纯函数，无 IO）
-├── ts_writer.py     # segment muxer 一次成型切片 + 逐片复测
+├── ts_writer.py     # segment muxer 一次成型切片 + 逐片复测（含水印分支）
 ├── m3u8.py          # M3U8 渲染与合规校验（纯函数）
-└── packager.py      # 编排层：probe → plan → 切片 → 复测 → 播放列表
-tests/               # pytest：39 个纯逻辑单测 + 19 个 ffmpeg 集成测试
+├── packager.py      # 编排层：probe → plan → 切片 → 复测 → 播放列表
+└── watermark/       # 文字水印：自研栅格化 + 安全叠加（仅依赖标准库）
+    ├── utf8.py          # 手写 UTF-8 解码器（拒绝过长/代理/截断/越界）
+    ├── bitmap_font.py   # 内置 5x7 点阵字体（零依赖最终回退）
+    ├── ttf_font.py      # 自研 TrueType/TTC 解析（cmap/glyf/hmtx/loca...）
+    ├── rasterizer.py    # 扫描线 + 4x 超采样抗锯齿字形栅格化
+    ├── font_stack.py    # 字体发现与按码点回退链（显式→系统→点阵→豆腐块）
+    ├── rasterize.py     # 排版绘制：码点序列 → RGBA 位图 → PNG
+    ├── png_buf.py       # RGBA 位图与自研 PNG 编码
+    ├── escaping.py      # 过滤器路径转义 + shell/argv 引号包裹（防注入）
+    ├── overlay.py       # 九宫格定位 + ffmpeg overlay segment 命令构造
+    └── config.py        # WatermarkConfig 不可变配置与校验
+tests/               # pytest：纯逻辑单测 + ffmpeg 集成测试（含 72 个水印用例）
 ```
 
 数据单向流动，模块之间只通过 `models.py` 里的不可变 dataclass 通信：
@@ -128,6 +144,17 @@ python -m hls_packager input.mp4 output_dir/ -d 6 -w 3 -s 100 -p chunk
 
 # 允许写入非空输出目录（覆盖同名产物）
 python -m hls_packager input.mp4 output_dir/ -y
+
+# 叠加文字水印（视频轨重编码，音频仍流拷贝；不指定水印则保持流拷贝）
+python -m hls_packager input.mp4 output_dir/ -d 6 -y \
+  --watermark-text "直播水印 HLS 2026!" \
+  --watermark-size 30 --watermark-color white \
+  --watermark-anchor bottom-right
+
+# 指定显式字体（可重复传入形成回退链）与九宫格位置
+python -m hls_packager input.mp4 output_dir/ -y \
+  --watermark-text "机密" --watermark-font C:/Windows/Fonts/msyh.ttc \
+  --watermark-anchor top-left --watermark-margin-x 16 --watermark-margin-y 16
 ```
 
 参数一览：
@@ -141,23 +168,58 @@ python -m hls_packager input.mp4 output_dir/ -y
 | `-s/--media-sequence` | 首片 `EXT-X-MEDIA-SEQUENCE` 序号 | 0 |
 | `-p/--filename-prefix` | 分片文件名前缀 | seg |
 | `-y/--overwrite` | 允许写入非空目录并覆盖同名产物 | 关 |
+| `--watermark-text` | 水印文字（UTF-8，支持多字节/特殊字符）；不指定即不叠加 | 无 |
+| `--watermark-font` | 显式字体文件，可重复传入按顺序回退 | 系统字体 |
+| `--watermark-size` | 水印字号（像素） | 28 |
+| `--watermark-color` | 文字颜色（`#RGB`/`#RRGGBB`/命名色） | white |
+| `--watermark-opacity` | 不透明度 0.0~1.0 | 1.0 |
+| `--watermark-anchor` | 九宫格锚点（如 `top-left`/`center`/`bottom-right`） | bottom-right |
+| `--watermark-margin-x/y` | 水印距画面边缘的像素留白 | 24 / 24 |
 
 退出码：`0` 成功；`2` 可预期的输入/环境/切片错误；`3` 未知内部错误。
+
+### 文字水印的安全与回退设计
+
+- **防注入两道防线**：① 子进程始终以 argv **列表**启动、绝不经过 shell，
+  含空格/引号/分号/`$()`/反引号/中文的路径与文本作为独立元素原样传递；
+  ② 水印 PNG 经第二个 `-i` + 流标签进入过滤器图，**路径永不拼进
+  filtergraph 字符串**，从根上消除过滤器注入面。`escaping.py` 另提供
+  filtergraph 两级转义与 POSIX/Windows 引号包裹（仅用于日志展示）。
+- **字体回退链（逐码点决策）**：显式字体 → 系统 TrueType（CJK 字体优先，
+  支持 .ttf/.ttc）→ 内置 5x7 点阵（仅 ASCII）→ 豆腐块占位。解析失败的
+  字体被缓存跳过，绝不静默丢字。
+- **GOP 承诺不破坏**：重编码时把规划切点同时喂给 `-force_key_frames`，
+  并对图片输入加 `-loop 1`（否则单帧图片会经 `shortest` 截断整段视频），
+  保证每片首帧仍是 IDR、时间戳全局连续、`segment_times` 精确生效。
 
 ## 作为库调用
 
 ```python
 from hls_packager import package, plan_segments, render_playlist, PlaylistConfig
+from hls_packager import WatermarkConfig, render_text_png
 
 # 一键打包
 result = package("input.mp4", "out/", target_duration=4.0)
 for seg in result.segments:
     print(seg.sequence_number, seg.filename, seg.start_time, seg.duration)
 
+# 带文字水印的打包（watermark=None 时与纯流拷贝行为完全一致）
+wm = WatermarkConfig(
+    text="内部资料 2026",
+    font_size=30,
+    color="#FF8800",
+    anchor="bottom-right",
+)
+result = package("input.mp4", "out/", target_duration=6.0, watermark=wm, overwrite=True)
+
 # 也可单独使用纯函数模块
 planned = plan_segments(duration=30.0, target_duration=4.0,
                         keyframe_times=(0.0, 2.0, 4.0, ...))
 text = render_playlist(planned, PlaylistConfig(target_duration=4))
+
+# 只做文字栅格化（自行产出 RGBA PNG，不跑 ffmpeg）
+rendered = render_text_png(WatermarkConfig(text="水印 ABC"), "watermark.png")
+print(rendered.width, rendered.height, rendered.used_fallbacks)
 ```
 
 ## 产物说明
@@ -189,6 +251,9 @@ pytest
 
 - `tests/test_planner.py`、`test_m3u8.py`、`test_probe.py`、
   `test_ts_writer.py`：纯逻辑单测，不依赖 ffmpeg；
+- `tests/test_watermark_*.py`：水印单测（UTF-8 异常输入、字体回退、
+  转义注入、PNG 渲染）+ ffmpeg 集成测试（首帧 IDR、水印可见、
+  特殊字符路径、时间戳连续、CLI 端到端）；
 - `tests/test_integration.py`、`test_cli.py`：用 ffmpeg 合成
   H.264/HEVC、纯音频、大 GOP 等素材做端到端校验，覆盖首帧 IDR、
   独立解码、GOP 对齐、全局时间戳连续、concat 单调、M3U8 合规、
@@ -196,8 +261,12 @@ pytest
 
 ## 已知限制
 
-- 只做**重封装**，不转码；源编码无法承载于 MPEG-TS 时会明确报错，
+- 不带水印时只做**重封装**，不转码；源编码无法承载于 MPEG-TS 时会明确报错，
   不会偷偷转码。
+- **带水印必然重编码视频轨**（像素级叠加无法流拷贝），仅支持 H.264/HEVC/
+  MPEG-1/2 视频；音频仍流拷贝。纯音频输入不能叠加文字水印，会明确报错。
+- 自研 TrueType 解析器只支持 TrueType 轮廓与 cmap format 0/4/12；
+  OpenType/CFF（OTTO）、WOFF 会被跳过并走字体回退链，不影响主流程。
 - 单码率输出，不生成多码率 master playlist。
 - 直播模式产出的是"当前窗口快照"式 VOD 风格文件，不包含分片滚动
   清理与周期刷新守护进程；`MEDIA-SEQUENCE` 语义已就绪，可作为

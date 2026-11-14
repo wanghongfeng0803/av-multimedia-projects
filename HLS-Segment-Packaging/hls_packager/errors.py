@@ -35,3 +35,7 @@ class SegmenterError(PackagerError):
 
 class PlaylistError(PackagerError):
     """生成 M3U8 播放列表时参数不合法。"""
+
+
+class WatermarkError(PackagerError):
+    """文字水印的渲染参数、字体或叠加过程出错。"""
