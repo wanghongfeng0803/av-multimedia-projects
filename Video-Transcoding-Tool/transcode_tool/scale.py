@@ -43,12 +43,13 @@ __all__ = [
 MIN_DIMENSION = 2
 MAX_DIMENSION = 7680  # 8K 上限，超出视为参数笔误
 
-# 预设：以“高度”为锚点，宽度按源宽高比推导，因此 4:3 源选 1080p 也不会变形
+# 预设：以“高度”为锚点，宽度按源宽高比推导，因此 4:3 源选 1080p 也不会变形。
+# 键在查询前会经 _normalize_token 归一化（小写、去空格/下划线/连字符/点）。
 PRESETS: dict[str, int] = {
-    "240p": 240, "qntsc": 240,
+    "240p": 240, "nhd": 240,
     "360p": 360,
     "480p": 480, "sd": 480, "vga": 480,
-    "540p": 540, "qhd_early": 540,
+    "540p": 540, "qhd540": 540,
     "720p": 720, "hd": 720,
     "1080p": 1080, "fhd": 1080, "fullhd": 1080,
     "1440p": 1440, "2k": 1440, "qhd": 1440,
@@ -58,7 +59,8 @@ PRESETS: dict[str, int] = {
 
 _PERCENT_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*%\s*$")
 _BOX_RE = re.compile(r"^\s*(?P<w>\d+)\s*[x×]\s*(?P<h>\d+)\s*$", re.IGNORECASE)
-_HEIGHT_ONLY_RE = re.compile(r"^\s*(?:0\s*[x×])?\s*(?P<h>\d+)\s*$")
+# 前导 x 的定高写法：x720 / X720（0x720 由 _BOX_RE 处理）
+_HEIGHT_LEADING_X_RE = re.compile(r"^\s*[x×]\s*(?P<h>\d+)\s*$", re.IGNORECASE)
 _BARE_INT_RE = re.compile(r"^\s*(?P<n>\d+)\s*$")
 
 
@@ -203,8 +205,8 @@ def _resolve_raw_box(
             return _box_from_height(h, sw, sh, sar)
         raise ValueError(f"分辨率表达式 {requested!r} 的宽高不能同时为 0。")
 
-    # 4) 单边：裸整数按“定宽”，x720/0x720 风格按“定高”
-    h_only = _HEIGHT_ONLY_RE.match(requested)
+    # 4) 单边：裸整数按“定宽”，x720 风格按“定高”
+    h_only = _HEIGHT_LEADING_X_RE.match(requested)
     if h_only:
         return _box_from_height(int(h_only.group("h")), sw, sh, sar)
     bare = _BARE_INT_RE.match(requested)
@@ -232,7 +234,11 @@ def _box_from_height(target_h: float, sw: int, sh: int, sar: float) -> tuple[flo
 def _snap_even(
     raw_w: float, raw_h: float, requested: str, warnings: list[str]
 ) -> tuple[int, int]:
-    """向下取整为偶数，并对落到最小尺寸以下的结果抬升兜底。"""
+    """向下取整为偶数，并对落到最小尺寸以下的结果抬升兜底。
+
+    偶数取整是 yuv420p 的常规自动处理，不逐次告警；只有结果小到需要
+    抬升到最小合法尺寸（属于异常输入）时才明确提示。
+    """
     width = even_floor(raw_w)
     height = even_floor(raw_h)
 
@@ -244,13 +250,4 @@ def _snap_even(
             f"分辨率 {requested!r} 取整后为 {old[0]}x{old[1]}，"
             f"已抬升到 yuv420p 最小合法偶数尺寸 {width}x{height}。"
         )
-
-    # 取整/抬升后若与理论值不同，提示实际产物尺寸（奇数输入常见）
-    if (width, height) != (int(raw_w), int(raw_h)) and not any(
-        "最小合法偶数" in w for w in warnings
-    ):
-        if int(raw_w) % 2 or int(raw_h) % 2:
-            warnings.append(
-                f"目标尺寸含奇数像素，已向下取整为偶数 {width}x{height}。"
-            )
     return width, height

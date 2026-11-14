@@ -30,6 +30,20 @@ python transcode.py input.mkv -o out.webm --codec vp9 --container webm
 # 调节质量与速度（CRF 范围随编码不同；preset 支持命名档或数字档）
 python transcode.py input.mp4 --codec h265 --crf 28 --preset slow
 
+# 按目标码率编码（与 --crf 互斥）：vbr 可变 / abr 平均 / cbr 恒定
+python transcode.py input.mp4 --bitrate 2M --rate-mode vbr
+python transcode.py input.mp4 --bitrate 800k --rate-mode cbr
+
+# 指定输出分辨率（保持宽高比、自动偶数对齐，默认禁止放大）
+python transcode.py input.mp4 --resolution 1280x720   # 容纳盒内等比缩放
+python transcode.py input.mp4 --resolution x720       # 仅定高，宽按比例
+python transcode.py input.mp4 --resolution 50%        # 整体缩一半
+python transcode.py input.mp4 --resolution 1080p --allow-upscale
+
+# 码率 + 分辨率 + 分段可自由组合
+python transcode.py huge.mkv --bitrate 1500k --resolution 720p \
+    --segment-duration 300 --progress
+
 # 大文件：按每段时长或段数分段转码、无损拼接，带实时进度
 python transcode.py huge.mkv --codec h265 --segment-duration 300 --progress
 python transcode.py huge.mkv --segment-count 8 --progress
@@ -51,6 +65,14 @@ result = transcode("input.mov", "out.mkv", codec="h265", crf=28, preset="medium"
                    segment_count=4,
                    progress_callback=lambda r: print(f"{r*100:.1f}%"))
 print(result.video_codec, result.container, result.encoder, result.width, result.height)
+
+# 按目标码率 + 目标分辨率（与 crf 互斥；纯算法模块也可单独使用）
+from transcode_tool import parse_bitrate, plan_bitrate, parse_resolution
+result = transcode("input.mp4", "out.mp4", target_bitrate="2M", rate_mode="vbr",
+                   resolution="1280x720")
+print(result.target_bitrate_bps, result.rate_mode, result.width, result.height)
+print(plan_bitrate("800k", "cbr"))          # BitratePlan（峰值/缓冲/下限推导）
+print(parse_resolution("1080p", 1920, 1080))  # ResolutionPlan（偶数对齐后的尺寸）
 
 # 查看注册表（纯数据，不启动进程）
 for spec in list_codecs():
@@ -77,6 +99,36 @@ for spec in list_codecs():
 
 `preset` 统一使用 x264 风格十档命名（`ultrafast` … `placebo`），由各编码模块翻译成
 编码器原生参数；libvpx/libaom/SVT-AV1/rav1e 也接受原生数字档位（如 `"4"`）。
+
+## 目标码率与输出分辨率
+
+除 CRF 常量质量外，工具支持**按目标码率**与**目标分辨率**编码，两者均为零三方
+依赖的自研算法（仅做数值/字符串计算，ffmpeg 参数按编码器分别适配）。
+
+**码率控制**（`--bitrate`，与 `--crf` 互斥，`--rate-mode` 选模式）：
+
+| 模式 | 语义 | 参数策略 |
+| --- | --- | --- |
+| `vbr`（默认） | 围绕目标浮动，峰值=目标×2、VBV 缓冲=目标×2 | `-b:v` + `-maxrate` + `-bufsize` |
+| `abr` | 长期均值贴合目标，不加硬性 VBV 约束 | 仅 `-b:v` |
+| `cbr` | min=max=目标、紧凑 1 秒缓冲，波动最小 | `-b:v/-minrate/-maxrate/-bufsize` |
+
+码率字符串支持 `800k` / `2.5Mbps` / `1G` / 纯整数 bps（SI 十进制，1k=1000），
+合法区间 **1kbps ~ 1Gbps**，越界、负数、未知单位在启动 ffmpeg 前即报错。
+各编码器差异已在本机实测并分别处理：
+
+- **libsvtav1** 在码率模式下不接受 `-maxrate`（会直接报错），其 CBR 改用私有
+  `-svtav1-params rc=1`；
+- **libx264** 严格 CBR 需要 `nal-hrd=cbr`，但该信号不允许进入 MP4，因此 MP4
+  退化为紧凑 VBV 的准 CBR，MKV 等容器才注入 HRD 填充 NAL；
+- libvpx/libaom 用 `-cpu-used`、rav1e 用 `-speed`，码率模式下仍由 preset 翻译。
+
+**分辨率**（`--resolution`）支持 `1920x1080`（容纳盒等比缩放，不拉伸）、
+`1280`/`1280x0`（定宽）、`x720`/`0x720`（定高）、`50%`（百分比）、
+`720p/1080p/4k` 等预设。所有结果在 Python 侧**向下取整为偶数**满足 yuv420p，
+极小结果抬升到最小合法尺寸 2×2，超过 8K（7680px）视为笔误报错；
+**默认禁止放大**（放大不增加真实细节，会收敛回源尺寸并告警），
+`--allow-upscale` 可显式放开。码率、分辨率、分段、容器可自由组合。
 
 ## 大文件分段转码
 
@@ -121,8 +173,12 @@ input                 输入视频（按内容探测，扩展名不限）
 -o, --output PATH     输出路径；省略时在输入旁生成 <名>_<编码>.<容器扩展名>
 --codec CODEC         h264 / h265 / vp9 / vp8 / av1（含别名，默认 h264）
 --container NAME      mp4 / webm / mkv；省略时按输出扩展名推断，再取编码首选容器
---crf N               质量参数，范围随编码；省略用编码默认值
+--crf N               质量参数，范围随编码；省略用编码默认值（与 --bitrate 互斥）
 --preset NAME         十档命名或编码器原生数字档位
+--bitrate RATE        目标视频码率（800k/2M/整数bps），给定后按码率编码并忽略 --crf
+--rate-mode MODE      vbr(默认) / abr / cbr，仅配合 --bitrate
+--resolution SPEC     1920x1080 / 1280(定宽) / x720(定高) / 50% / 720p、4k 等
+--allow-upscale       允许放大到比源更大的分辨率（默认禁止，收敛回源尺寸）
 --audio-bitrate RATE  音频重编码码率（默认 128k）
 --segment-duration S  分段单段时长（秒），与 --segment-count 二选一
 --segment-count N     分段数量
@@ -155,6 +211,8 @@ transcode_tool/
 ├── errors.py         # 异常类型与退出码映射（含 EncoderUnavailableError）
 ├── models.py         # MediaInfo / StreamInfo / TranscodeResult 数据模型
 ├── codecs.py         # 编码注册表：CRF/preset 语义、编码器候选、ffmpeg 参数构建
+├── bitrate.py        # 目标码率：字符串解析、VBR/ABR/CBR 规划、各编码器码控参数
+├── scale.py          # 分辨率规划：表达式解析、宽高比保持、偶数对齐、缩放滤镜
 ├── containers.py     # 容器注册表：兼容矩阵、扩展名、音频直通/重编码策略
 ├── capabilities.py   # 解析 ffmpeg -encoders 探测本机能力（缓存 + 乐观降级）
 ├── probe.py          # ffprobe 探测，容忍损坏文件
