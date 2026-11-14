@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 演示产物（保留生成脚本）
+demo/*.png

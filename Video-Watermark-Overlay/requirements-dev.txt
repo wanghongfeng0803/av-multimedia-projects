@@ -1,0 +1,2 @@
+# 本工具运行时仅依赖 Python 标准库；pytest 仅用于开发测试
+pytest>=7.0
