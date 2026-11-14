@@ -119,3 +119,27 @@ def test_rejects_empty_and_bad_config():
         render_playlist(segs, PlaylistConfig(target_duration=0))
     with pytest.raises(PlaylistError):
         render_playlist(segs, PlaylistConfig(target_duration=4, window_size=0))
+
+
+def test_custom_version_for_fmp4_container():
+    segs = _segments(2, 4.0)
+    text = render_playlist(
+        segs, PlaylistConfig(target_duration=4, version=7)
+    )
+    assert "#EXT-X-VERSION:7" in text
+    assert "#EXT-X-VERSION:3" not in text
+
+
+def test_default_version_remains_three():
+    # 旧调用不传 version：渲染结果与历史版本逐字节一致
+    text = render_playlist(
+        _segments(1, 4.0), PlaylistConfig(target_duration=4)
+    )
+    assert "#EXT-X-VERSION:3" in text
+
+
+def test_rejects_non_positive_version():
+    with pytest.raises(PlaylistError):
+        render_playlist(
+            _segments(1, 4.0), PlaylistConfig(target_duration=4, version=0)
+        )

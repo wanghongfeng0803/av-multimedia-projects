@@ -60,3 +60,59 @@ def test_cli_missing_input_returns_error_code(tmp_path):
 def test_cli_bad_duration_returns_error_code(h264_file, out_dir):
     exit_code = main([h264_file, out_dir, "-d", "0", "-y"])
     assert exit_code == 2
+
+
+def test_cli_custom_name_template(h264_file, out_dir):
+    exit_code = main([
+        h264_file, out_dir, "-d", "6", "-y",
+        "--name-template", "{name}-{sequence:05d}.{ext}",
+        "-p", "ep",
+    ])
+    assert exit_code == 0
+    files = os.listdir(out_dir)
+    assert any(f.startswith("ep-00000") and f.endswith(".ts") for f in files)
+    playlist = open(
+        os.path.join(out_dir, "playlist.m3u8"), encoding="utf-8"
+    ).read()
+    assert "ep-00000.ts" in playlist
+
+
+def test_cli_fmp4_container(h264_file, out_dir):
+    exit_code = main([
+        h264_file, out_dir, "-d", "4", "-y",
+        "--segment-format", "fmp4",
+    ])
+    assert exit_code == 0
+    assert any(f.endswith(".m4s") for f in os.listdir(out_dir))
+    playlist = open(
+        os.path.join(out_dir, "playlist.m3u8"), encoding="utf-8"
+    ).read()
+    assert "#EXT-X-VERSION:7" in playlist
+
+
+def test_cli_mkv_container_and_align_mode(h264_file, out_dir):
+    exit_code = main([
+        h264_file, out_dir, "-d", "4", "-y",
+        "--segment-format", "mkv", "--align-mode", "before",
+    ])
+    assert exit_code == 0
+    assert any(f.endswith(".mkv") for f in os.listdir(out_dir))
+
+
+def test_cli_rejects_unknown_container(h264_file, out_dir):
+    # argparse choices 非法值直接以退出码 2 终止
+    with pytest.raises(SystemExit):
+        main([h264_file, out_dir, "--segment-format", "avi"])
+
+
+def test_cli_rejects_bad_name_template(h264_file, out_dir):
+    exit_code = main([
+        h264_file, out_dir, "-y",
+        "--name-template", "{sequence:04d}.{ext}",  # 缺 {name}
+    ])
+    assert exit_code == 2
+
+
+def test_cli_rejects_bad_align_mode(h264_file, out_dir):
+    with pytest.raises(SystemExit):
+        main([h264_file, out_dir, "--align-mode", "strict"])

@@ -53,6 +53,9 @@ class PlaylistConfig:
     independent_segments: bool = True
     #: AES-128 密钥描述；None 表示不加密（不输出 EXT-X-KEY，行为同旧版）
     key: KeyDescriptor | None = None
+    #: EXT-X-VERSION：TS 分片为 3；fMP4/MP4 分片按 RFC 8216 提升到 7。
+    #: 默认取模块常量 :data:`HLS_VERSION`，旧调用不传时渲染结果不变。
+    version: int = HLS_VERSION
 
 
 def compute_target_duration(segments: list[SegmentInfo]) -> int:
@@ -71,6 +74,8 @@ def _validate(
         raise PlaylistError("播放列表至少要包含一个分片")
     if config.target_duration <= 0:
         raise PlaylistError("TARGETDURATION 必须为正整数")
+    if config.version <= 0:
+        raise PlaylistError("EXT-X-VERSION 必须为正整数")
 
     overlong = [
         seg.filename
@@ -113,7 +118,7 @@ def render_playlist(
 
     lines = [
         "#EXTM3U",
-        f"#EXT-X-VERSION:{HLS_VERSION}",
+        f"#EXT-X-VERSION:{config.version}",
         f"#EXT-X-TARGETDURATION:{config.target_duration}",
         f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}",
     ]

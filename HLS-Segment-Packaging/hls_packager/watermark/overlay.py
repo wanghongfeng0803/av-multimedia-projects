@@ -13,8 +13,10 @@ from __future__ import annotations
 import os
 
 from ..binaries import ffmpeg_path
+from ..containers import DEFAULT_CONTAINER, ContainerSpec, get_container
 from ..errors import UnsupportedInputError, WatermarkError
 from ..models import MediaInfo, SegmentInfo
+from ..naming import NamingConfig
 from .config import WatermarkConfig
 
 _ARGV_SOFT_LIMIT = 30000
@@ -88,20 +90,33 @@ def build_watermarked_segment_command(
     maps: list[str],
     watermark_png: str,
     config: WatermarkConfig,
+    container: ContainerSpec | None = None,
+    naming: NamingConfig | None = None,
 ) -> list[str]:
     """构造"重编码视频 + overlay 水印 + segment 切割"的 argv。
 
     全部路径以独立 argv 元素传递（列表形式，不走 shell），
     含空格/引号/分号/中文的路径都原样到达 ffmpeg。
+
+    ``container`` / ``naming`` 为 ``None`` 时回退到 MPEG-TS + 默认
+    命名模板，与历史命令逐字节一致。
     """
     if not planned:
         raise WatermarkError("分片规划为空，无法构造水印切片命令")
     if not os.path.isfile(watermark_png):
         raise WatermarkError(f"水印 PNG 不存在：{watermark_png}")
 
+    spec = container if container is not None else get_container(DEFAULT_CONTAINER)
+    if naming is None:
+        naming = NamingConfig(
+            name_prefix=filename_prefix, extension=spec.extension
+        )
+
     encoder = _select_video_encoder(media)
     cut_times = ",".join(f"{seg.source_start:.6f}" for seg in planned[1:])
-    output_pattern = os.path.join(output_dir, f"{filename_prefix}_%04d.ts")
+    output_pattern, ffmpeg_start = naming.ffmpeg_pattern(
+        output_dir, sequence_start=planned[0].sequence_number
+    )
     filter_graph = build_filter_graph(config)
 
     argv = [
@@ -123,8 +138,10 @@ def build_watermarked_segment_command(
 
     if cut_times:
         argv.extend(["-force_key_frames", cut_times])
-    argv.extend(["-f", "segment", "-segment_format", "mpegts",
-                 "-segment_start_number", str(planned[0].sequence_number)])
+    argv.extend(["-f", "segment", "-segment_format", spec.segment_format,
+                 "-segment_start_number", str(ffmpeg_start)])
+    # 容器级 muxer 选项（如 fmp4 的 -movflags 碎片化参数）
+    argv.extend(spec.muxer_options)
     if cut_times:
         argv.extend(["-segment_times", cut_times])
     argv.append(output_pattern)

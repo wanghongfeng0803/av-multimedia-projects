@@ -36,6 +36,7 @@ from .encryption import (
 )
 from .errors import (
     BinaryNotFoundError,
+    NamingError,
     PackagerError,
     PlaylistError,
     ProbeError,
@@ -45,8 +46,22 @@ from .errors import (
 )
 from .m3u8 import PlaylistConfig, compute_target_duration, render_playlist
 from .models import MediaInfo, PackagingResult, SegmentInfo, StreamInfo
+from .naming import DEFAULT_NAME_PREFIX, DEFAULT_NAME_TEMPLATE, NamingConfig
+from .containers import (
+    DEFAULT_CONTAINER,
+    SUPPORTED_CONTAINERS,
+    CONTAINER_SPECS,
+    ContainerSpec,
+    get_container,
+)
 from .packager import package
-from .planner import plan_segments
+from .planner import (
+    ALIGN_AFTER,
+    ALIGN_BEFORE,
+    ALIGN_MODES,
+    ALIGN_NEAREST,
+    plan_segments,
+)
 from .probe import probe_media
 from .watermark import (
     WatermarkConfig,
@@ -74,11 +89,26 @@ __all__ = [
     "SegmenterError",
     "PlaylistError",
     "WatermarkError",
+    "NamingError",
     "WatermarkConfig",
     "render_text_png",
     "decode_utf8",
     "escape_filter_path",
     "build_watermarked_segment_command",
+    # 命名模板与容器规格
+    "NamingConfig",
+    "DEFAULT_NAME_TEMPLATE",
+    "DEFAULT_NAME_PREFIX",
+    "ContainerSpec",
+    "CONTAINER_SPECS",
+    "SUPPORTED_CONTAINERS",
+    "DEFAULT_CONTAINER",
+    "get_container",
+    # GOP 切点对齐模式
+    "ALIGN_NEAREST",
+    "ALIGN_BEFORE",
+    "ALIGN_AFTER",
+    "ALIGN_MODES",
     # AES-128 分片加密（RFC 8216）
     "EncryptionConfig",
     "EncryptionError",
@@ -102,4 +132,4 @@ __all__ = [
     "pkcs7_unpad",
 ]
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

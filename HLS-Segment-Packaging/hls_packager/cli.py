@@ -6,8 +6,11 @@ import argparse
 import sys
 
 from .encryption import DEFAULT_KEY_FILENAME, EncryptionConfig, EncryptionError
+from .containers import SUPPORTED_CONTAINERS
 from .errors import PackagerError
+from .naming import DEFAULT_NAME_TEMPLATE
 from .packager import PLAYLIST_FILENAME, package
+from .planner import ALIGN_MODES
 from .watermark.config import VALID_ANCHORS, WatermarkConfig
 
 EXIT_OK = 0
@@ -54,7 +57,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-p", "--filename-prefix",
         default="seg",
-        help="分片文件名前缀，默认 seg（产出 seg_0000.ts ...）",
+        help="分片文件名前缀（命名模板中 {name} 的值），默认 seg",
+    )
+    parser.add_argument(
+        "--name-template",
+        default=None,
+        metavar="TEMPLATE",
+        help=(
+            "分片命名模板，占位符：{name} 前缀、{sequence} 绝对序号、"
+            "{index} 运行内序号、{ext} 扩展名；序号支持零填充如 "
+            "{sequence:05d}。默认 "
+            + DEFAULT_NAME_TEMPLATE
+            + "（产出 seg_0000.ts ...）"
+        ),
+    )
+    parser.add_argument(
+        "--segment-format",
+        choices=SUPPORTED_CONTAINERS,
+        default="ts",
+        help=(
+            "分片封装格式：ts=MPEG-TS（默认，HLS 标准）、"
+            "fmp4=自包含碎片化 MP4（CMAF 风格）、mp4=普通 ISO-BMFF、"
+            "mkv=Matroska；仅影响封装层，GOP 对齐逻辑不变"
+        ),
+    )
+    parser.add_argument(
+        "--align-mode",
+        choices=ALIGN_MODES,
+        default="nearest",
+        help=(
+            "切点对齐关键帧的策略：nearest=距理想切点最近（默认，同距"
+            "取靠前）、before=不超过目标时长、after=不短于目标时长；"
+            "纯音频输入下该参数无效"
+        ),
     )
 
     # ---- 文字水印（自行栅格化后重编码视频轨叠加；不指定则保持流拷贝） ----
@@ -282,6 +317,9 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             watermark=watermark,
             encryption=encryption,
+            name_template=args.name_template,
+            container=args.segment_format,
+            align_mode=args.align_mode,
         )
     except PackagerError as exc:
         # 可预期的输入/环境/切片问题：明确中文提示 + 非零退出码

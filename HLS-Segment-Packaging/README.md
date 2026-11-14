@@ -7,7 +7,22 @@
 ## 功能特性
 
 - **GOP 对齐切片**：切点只落在 IDR 关键帧上，每个分片首帧可独立解码，
-  播放器任意 seek / 起播都不会花屏。
+  播放器任意 seek / 起播都不会花屏。切点策略可选 `nearest`（默认，
+  距理想切点最近）/ `before`（片长不超过目标值）/ `after`（片长不短于
+  目标值）三种对齐模式。
+- **自定义分片时长**：`-d/--segment-duration` 接受任意正浮点秒数，
+  规划器在关键帧序列中按选定模式就近切点；末段不足时长时自然收尾，
+  纯音频输入的过短尾片自动并入前一片。
+- **可配置命名模板**：`--name-template` 支持 `{name}` 前缀、
+  `{sequence}` 绝对序号（MEDIA-SEQUENCE）、`{index}` 运行内序号、
+  `{ext}` 容器扩展名四个占位符，序号支持任意位宽零填充
+  （如 `{sequence:05d}`）；默认模板 `{name}_{sequence:04d}.{ext}`
+  与历史文件名逐字节一致。模板含路径分隔符 / Windows 保留字符 /
+  渲染重名时在切片前明确报错。
+- **多种分片封装**：`--segment-format` 支持 `ts`（MPEG-TS，默认）、
+  `fmp4`（自包含碎片化 MP4 / CMAF 风格，每片带 ftyp 可独立解码）、
+  `mp4`（普通 ISO-BMFF）、`mkv`（Matroska）；播放列表版本随容器
+  自动选择（TS=3，ISO-BMFF=7），各容器有独立的流拷贝编码白名单。
 - **时间戳连续**：各分片保留全局连续的 PTS/DTS，跨分片首尾相接、
   无回退、无跳变；拼接后 DTS 严格单调。
 - **规范的 M3U8**：自带 `EXT-X-VERSION`、`EXT-X-TARGETDURATION`、
@@ -44,7 +59,9 @@ hls_packager/
 ├── process.py       # 子进程执行封装
 ├── models.py        # 不可变数据模型（StreamInfo/MediaInfo/SegmentInfo...）
 ├── probe.py         # ffprobe 探测 + 关键帧时间序列提取
-├── planner.py       # GOP 对齐分片规划（纯函数，无 IO）
+├── planner.py       # GOP 对齐分片规划（纯函数，无 IO，含三种对齐模式）
+├── naming.py        # 命名模板：占位符渲染、零填充、安全校验、ffmpeg 模式翻译
+├── containers.py    # 分片容器规格（ts/fmp4/mp4/mkv 的 muxer/扩展名/版本/编码白名单）
 ├── ts_writer.py     # segment muxer 一次成型切片 + 逐片复测（含水印分支）
 ├── m3u8.py          # M3U8 渲染与合规校验（纯函数，含 EXT-X-KEY）
 ├── packager.py      # 编排层：probe → plan → 切片 → 复测 → 加密 → 播放列表
@@ -93,12 +110,29 @@ MediaInfo
 ### 1. GOP 对齐算法（`planner.py`）
 
 每个分片从当前边界 `current` 出发，理想切点为 `current + 目标时长`，
-在其后的关键帧中选择**距理想切点最近**的一个；距离相同取**靠前**的关键帧。
+再按 `--align-mode` 在关键帧中选点：
+
+- `nearest`（默认）：距理想切点**最近**的关键帧，距离相同取**靠前**
+  的一个（保证分片不会无谓变长）；
+- `before`：只取理想切点之前（含重合）最近的关键帧，非末片时长不会
+  超过目标值；首个 GOP 就长于目标值、前侧无候选时退取之后最近的
+  关键帧，避免切出零长度分片；
+- `after`：只取理想切点之后（含重合）最近的关键帧，非末片时长不会
+  短于目标值。
+
+无论哪种模式：
 
 - 所有切点必然是关键帧时刻，分片首帧即 IDR；
 - **大 GOP 场景**（关键帧间隔 > 目标时长）下分片会比目标长——这是
   GOP 对齐的必然代价，`TARGETDURATION` 会按实际最大片长自动放大；
-- 纯音频 / 无关键帧信息时退化为等长规划，过短的尾片自动并入前一片。
+- 纯音频 / 无关键帧信息时退化为等长规划，过短的尾片自动并入前一片，
+  对齐模式对其无意义（切点不受关键帧约束）。
+
+**末段与精度处理**：理想切点越过源末尾时不再切，剩余内容自然并入
+末片；内部时间比较统一走 1ms 容差（`_EPS`）吸收容器时间戳抖动，
+落盘值 round 到 6 位小数（微秒级，高于 MPEG-TS 90kHz 时钟的单 tick
+精度）；计划片长之和与源时长严格相等，实际片长以切后 ffprobe
+复测为准。
 
 ### 2. 为什么用 segment muxer 而不是逐片 `-ss/-t`
 
@@ -161,6 +195,41 @@ hls muxer 或其自带播放列表。
 - **不启用即等价**：`encryption=None` 时该旁路完全不执行，播放列表
   无 `EXT-X-KEY`、分片首字节仍是 TS 同步字节 `0x47`，由回归测试锁定。
 
+### 6. 命名模板（`naming.py`）
+
+模板是一段普通字符串，四个占位符：
+
+| 占位符 | 含义 | 示例 |
+| --- | --- | --- |
+| `{name}` | 文件名前缀（`-p/--filename-prefix` 的值） | `seg` |
+| `{sequence}` | 绝对序号，即 EXT-X-MEDIA-SEQUENCE | `0, 1, 2 ...` |
+| `{index}` | 运行内序号，与 MEDIA-SEQUENCE 起始值无关，恒从 0 起 | `0, 1, 2 ...` |
+| `{ext}` | 容器扩展名（由 `--segment-format` 决定，不含点） | `ts` / `m4s` |
+
+序号占位符支持零填充宽度说明：`{sequence:05d}` 产出 `00042`；
+不写宽度（`{index}`）则不补零。模板最终被翻译成 ffmpeg segment
+muxer 的计数器模式串（`%05d` 风格），因此非零填充格式说明
+（如 `{index:>5}`）会被拒绝；一个模板有且只能有一个序号占位符。
+
+安全边界：模板字面部分禁止路径分隔符与 Windows 保留字符
+（`<>:"/\\|?*`）、控制字符与字面 `%`；全部文件名在切片前预渲染
+并检测重名，非法输入在任何 ffmpeg 调用之前报 `NamingError`。
+
+### 7. 多容器封装（`containers.py`）
+
+容器只影响**封装层**，GOP 规划、时间戳连续性、逐片复测与加密
+逻辑完全复用：
+
+| 短名 | ffmpeg muxer | 扩展名 | HLS 版本 | 说明 |
+| --- | --- | --- | --- | --- |
+| `ts`（默认） | `mpegts` | `.ts` | 3 | RFC 8216 原生格式，兼容性最好 |
+| `fmp4` | `mp4` + `empty_moov` 等 movflags | `.m4s` | 7 | 自包含碎片化 MP4，每片带 ftyp、无需独立 init 段即可独立起播 |
+| `mp4` | `mp4` | `.mp4` | 7 | 普通 ISO-BMFF 分片，通用播放器可直接打开 |
+| `mkv` | `matroska` | `.mkv` | 3 | Matroska，编码承载面最宽（含 FLAC/Vorbis/AV1） |
+
+每种容器维护独立的流拷贝编码白名单：主视频编码不被承载时直接
+报错，个别不支持的音频轨跳过（与既有策略一致）。
+
 ## 安装与环境
 
 需要系统提供 `ffmpeg` 与 `ffprobe`（建议 4.4+）。可执行文件查找顺序：
@@ -183,6 +252,21 @@ python -m hls_packager input.mp4 output_dir/
 
 # 指定目标分片时长（实际切点对齐最近关键帧）
 python -m hls_packager input.mp4 output_dir/ --segment-duration 4
+
+# 切点不超过目标时长（before 模式），适合要求片长有上限的归档场景
+python -m hls_packager input.mp4 output_dir/ -d 4 --align-mode before
+
+# 自定义命名模板：5 位零填充绝对序号 + fMP4 容器
+python -m hls_packager input.mp4 output_dir/ -d 4 \
+  --segment-format fmp4 \
+  --name-template "{name}-{sequence:05d}.{ext}"
+
+# 文件名按运行内序号编号（MEDIA-SEQUENCE 仍可从任意值起算）
+python -m hls_packager input.mp4 output_dir/ -s 100 \
+  --name-template "{name}_{index:03d}.{ext}"
+
+# 输出 Matroska 分片（编码承载面更宽）
+python -m hls_packager input.mp4 output_dir/ --segment-format mkv
 
 # 直播滑动窗口（保留最近 3 片）+ 自定义起始序号与文件名前缀
 python -m hls_packager input.mp4 output_dir/ -d 6 -w 3 -s 100 -p chunk
@@ -221,10 +305,13 @@ python -m hls_packager input.mp4 output_dir/ -y \
 | --- | --- | --- |
 | `input` | 输入媒体文件（mp4/mkv/mov/ts/m4a 等） | 必填 |
 | `output_dir` | HLS 产物输出目录（自动创建） | 必填 |
-| `-d/--segment-duration` | 目标分片时长（秒），切点对齐 GOP | 6 |
+| `-d/--segment-duration` | 目标分片时长（秒，支持小数），切点对齐 GOP | 6 |
+| `--align-mode` | 切点对齐模式：`nearest`/`before`/`after`（纯音频无效） | nearest |
+| `--segment-format` | 分片容器：`ts`/`fmp4`/`mp4`/`mkv` | ts |
+| `--name-template` | 命名模板，占位符 `{name}`/`{sequence}`/`{index}`/`{ext}`，序号可零填充 | `{name}_{sequence:04d}.{ext}` |
 | `-w/--window-size` | 直播滑动窗口分片数；不指定即 VOD | 无 |
 | `-s/--media-sequence` | 首片 `EXT-X-MEDIA-SEQUENCE` 序号 | 0 |
-| `-p/--filename-prefix` | 分片文件名前缀 | seg |
+| `-p/--filename-prefix` | 分片文件名前缀（模板中 `{name}` 的值） | seg |
 | `-y/--overwrite` | 允许写入非空目录并覆盖同名产物 | 关 |
 | `--watermark-text` | 水印文字（UTF-8，支持多字节/特殊字符）；不指定即不叠加 | 无 |
 | `--watermark-font` | 显式字体文件，可重复传入按顺序回退 | 系统字体 |
@@ -266,6 +353,28 @@ from hls_packager import WatermarkConfig, render_text_png
 result = package("input.mp4", "out/", target_duration=4.0)
 for seg in result.segments:
     print(seg.sequence_number, seg.filename, seg.start_time, seg.duration)
+
+# 自定义分片容器 + 命名模板 + 对齐模式
+result = package(
+    "input.mp4", "out/",
+    target_duration=4.0,
+    container="fmp4",                              # ts / fmp4 / mp4 / mkv
+    align_mode="before",                           # 片长不超过目标值
+    name_template="{name}-{sequence:05d}.{ext}",
+    filename_prefix="ep",
+    overwrite=True,
+)
+
+# 也可直接使用命名模板与容器规格这两个纯逻辑组件
+from hls_packager import NamingConfig, get_container
+
+spec = get_container("fmp4")
+naming = NamingConfig(template="{name}_{index:03d}.{ext}",
+                      name_prefix="seg", extension=spec.extension)
+print(naming.render_many(count=3, sequence_start=100))
+# -> ['seg_000.m4s', 'seg_001.m4s', 'seg_002.m4s']
+print(naming.ffmpeg_pattern("out", sequence_start=100))
+# -> ('out/seg_%03d.m4s', 0)  # index 模式 ffmpeg 计数器恒从 0 起
 
 # 带文字水印的打包（watermark=None 时与纯流拷贝行为完全一致）
 wm = WatermarkConfig(
@@ -309,13 +418,17 @@ output_dir/
 
 ## 支持的编码
 
-流拷贝进 MPEG-TS，无需重编码的常见编码：
+流拷贝不重编码，各容器的可承载编码白名单（定义在 `containers.py`）：
 
-- 视频：H.264/AVC、HEVC、MPEG-1/2；
-- 音频：AAC、MP3、AC-3、E-AC-3、MP2、Opus。
+- **MPEG-TS（ts）**：视频 H.264/AVC、HEVC、MPEG-1/2；音频 AAC、MP3、
+  AC-3、E-AC-3、MP2、Opus；
+- **ISO-BMFF（fmp4 / mp4）**：视频 H.264、HEVC、MPEG-4 Part 2；
+  音频 AAC、MP3、AC-3、E-AC-3、Opus；
+- **Matroska（mkv）**：在上述基础上另支持 AV1 视频与 FLAC、Vorbis、
+  PCM 音频，承载面最宽。
 
-主视频编码不支持时直接报错（避免静默产出只有声音的"视频"）；
-个别不支持的音频轨道会跳过。字幕 / 数据流不打入 TS 分片。
+主视频编码不被目标容器支持时直接报错（避免静默产出只有声音的
+"视频"）；个别不支持的音频轨道会跳过。字幕 / 数据流不打入分片。
 
 ## 运行测试
 
@@ -324,7 +437,9 @@ pytest
 ```
 
 - `tests/test_planner.py`、`test_m3u8.py`、`test_probe.py`、
-  `test_ts_writer.py`：纯逻辑单测，不依赖 ffmpeg；
+  `test_ts_writer.py`、`test_naming.py`、`test_containers.py`：
+  纯逻辑单测，不依赖 ffmpeg——覆盖 GOP 三种对齐模式、命名模板渲染
+  与安全校验、容器规格/编码白名单/命令构造；
 - `tests/test_encryption_aes.py`、`test_encryption_config.py`、
   `test_encryption_segment_io.py`：加密纯逻辑单测——FIPS-197 / SP 800-38A
   官方向量、PKCS#7 畸形填充、密钥/IV/URI 容错、流式分块等价、原子替换
@@ -335,15 +450,17 @@ pytest
 - `tests/test_watermark_*.py`：水印单测（UTF-8 异常输入、字体回退、
   转义注入、PNG 渲染）+ ffmpeg 集成测试（首帧 IDR、水印可见、
   特殊字符路径、时间戳连续、CLI 端到端）；
-- `tests/test_integration.py`、`test_cli.py`：用 ffmpeg 合成
+- `tests/test_integration.py`、`test_cli.py`、
+  `test_containers_integration.py`：用 ffmpeg 合成
   H.264/HEVC、纯音频、大 GOP 等素材做端到端校验，覆盖首帧 IDR、
   独立解码、GOP 对齐、全局时间戳连续、concat 单调、M3U8 合规、
-  滑动窗口等口径。无 ffmpeg 时自动 skip。
+  滑动窗口，以及四种容器落盘签名、模板命名与对齐模式。无 ffmpeg
+  时自动 skip。
 
 ## 已知限制
 
-- 不带水印时只做**重封装**，不转码；源编码无法承载于 MPEG-TS 时会明确报错，
-  不会偷偷转码。
+- 不带水印时只做**重封装**，不转码；源编码无法承载于目标容器时会
+  明确报错，不会偷偷转码。
 - **带水印必然重编码视频轨**（像素级叠加无法流拷贝），仅支持 H.264/HEVC/
   MPEG-1/2 视频；音频仍流拷贝。纯音频输入不能叠加文字水印，会明确报错。
 - 自研 TrueType 解析器只支持 TrueType 轮廓与 cmap format 0/4/12；

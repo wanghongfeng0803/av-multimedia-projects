@@ -28,16 +28,14 @@ import os
 from dataclasses import dataclass
 
 from .binaries import ffprobe_path, ffmpeg_path
+from .containers import DEFAULT_CONTAINER, ContainerSpec, get_container
 from .errors import SegmenterError, UnsupportedInputError
 from .models import MediaInfo, SegmentInfo
+from .naming import NamingConfig
 from .process import run_capture
 from .watermark.config import WatermarkConfig
 from .watermark.overlay import build_watermarked_segment_command
 from .watermark.rasterize import render_text_png
-
-# MPEG-TS 支持的编码白名单（ffmpeg mpegts muxer 可直接承载的常见编码）
-_TS_VIDEO_CODECS = {"h264", "hevc", "mpeg2video", "mpeg1video", "mp4"}
-_TS_AUDIO_CODECS = {"aac", "mp3", "ac3", "eac3", "mp2", "opus"}
 
 # 子进程超时系数：按整文件时长放宽，最低 60 秒，兼容慢速磁盘
 _TIMEOUT_BASE = 60.0
@@ -58,28 +56,38 @@ class WrittenSegment:
     size_bytes: int
 
 
-def validate_codecs(media: MediaInfo) -> list[str]:
-    """检查待打包的流能否写进 MPEG-TS，返回 ffmpeg -map 参数列表。
+def validate_codecs(
+    media: MediaInfo, container: ContainerSpec | None = None
+) -> list[str]:
+    """检查待打包的流能否写入目标容器，返回 ffmpeg -map 参数列表。
 
     策略：视频是主轨道，编码不支持时**直接报错**（避免静默产出只有
     声音的"视频"）；音频是次要轨道，不支持的音频跳过即可；
-    字幕 / 数据流 MPEG-TS 承载能力有限且 HLS TS 场景极少使用，直接忽略。
+    字幕 / 数据流容器承载能力有限且 HLS 分片场景极少使用，直接忽略。
+
+    :param container: 目标容器规格；``None`` 时按 MPEG-TS 白名单校验，
+        与历史版本行为完全一致。
     """
+    spec = container if container is not None else get_container(DEFAULT_CONTAINER)
+    video_allowed = set(spec.video_codecs)
+    audio_allowed = set(spec.audio_codecs)
+
     maps: list[str] = []
     skipped_audio: list[str] = []
 
     videos = media.video_streams
     if videos:
         video = videos[0]
-        if video.codec_name not in _TS_VIDEO_CODECS:
+        if video.codec_name not in video_allowed:
             raise UnsupportedInputError(
-                f"视频编码 {video.codec_name} 无法直接写入 MPEG-TS"
+                f"视频编码 {video.codec_name} 无法直接流拷贝进 "
+                f"{spec.segment_format} 容器（{spec.name}）"
                 "（需要先转码，本工具只做流拷贝重封装）"
             )
         maps.append("0:v:0?")
 
     for audio in media.audio_streams:
-        if audio.codec_name in _TS_AUDIO_CODECS:
+        if audio.codec_name in audio_allowed:
             maps.append(f"0:{audio.index}?")
         else:
             skipped_audio.append(audio.codec_name)
@@ -89,7 +97,9 @@ def validate_codecs(media: MediaInfo) -> list[str]:
             f"（已跳过不支持的音频编码：{'、'.join(skipped_audio)}）"
             if skipped_audio else ""
         )
-        raise UnsupportedInputError(f"没有可写入 MPEG-TS 的音视频流{detail}")
+        raise UnsupportedInputError(
+            f"没有可写入 {spec.name} 容器的音视频流{detail}"
+        )
     return maps
 
 
@@ -99,19 +109,33 @@ def build_segmentation_command(
     output_dir: str,
     filename_prefix: str,
     maps: list[str],
+    container: ContainerSpec | None = None,
+    naming: NamingConfig | None = None,
 ) -> list[str]:
     """构造一次性切片的 ffmpeg segment muxer 命令（独立成函数便于单测）。
 
     切点取规划中除首片起点（恒为 0）外的全部 ``source_start``；
-    输出文件名序号用 ``-segment_start_number`` 对齐 MEDIA-SEQUENCE。
+    输出文件名序号用 ``-segment_start_number`` 对齐命名模板的计数器
+    （``{sequence}`` 对齐 MEDIA-SEQUENCE，``{index}`` 恒从 0 起）。
+
+    ``container`` / ``naming`` 为 ``None`` 时回退到 MPEG-TS + 默认
+    模板（``{name}_{sequence:04d}.ts``），与历史命令逐字节一致。
     """
     if not planned:
         raise SegmenterError("分片规划为空，无法构造切片命令")
 
+    spec = container if container is not None else get_container(DEFAULT_CONTAINER)
+    if naming is None:
+        naming = NamingConfig(
+            name_prefix=filename_prefix, extension=spec.extension
+        )
+
     # segment_times 是"绝对源时间轴"上的切分时刻；首片从 0 开始无需列出
     cut_times = ",".join(f"{seg.source_start:.6f}" for seg in planned[1:])
     start_number = planned[0].sequence_number
-    output_pattern = os.path.join(output_dir, f"{filename_prefix}_%04d.ts")
+    output_pattern, ffmpeg_start = naming.ffmpeg_pattern(
+        output_dir, sequence_start=start_number
+    )
 
     argv = [
         ffmpeg_path(),
@@ -129,11 +153,13 @@ def build_segmentation_command(
         [
             "-c", "copy",
             "-f", "segment",
-            "-segment_format", "mpegts",
-            # 起始序号对齐 EXT-X-MEDIA-SEQUENCE，使文件名与规划一致
-            "-segment_start_number", str(start_number),
+            "-segment_format", spec.segment_format,
+            # 起始序号对齐命名模板的计数器，使文件名与规划一致
+            "-segment_start_number", str(ffmpeg_start),
         ]
     )
+    # 容器级 muxer 选项（如 fmp4 的 -movflags 碎片化参数）
+    argv.extend(spec.muxer_options)
     # 只有存在中间切点时才需要 segment_times（单分片文件不需要）
     if cut_times:
         argv.extend(["-segment_times", cut_times])
@@ -175,6 +201,8 @@ def write_all_segments(
     filename_prefix: str,
     maps: list[str],
     watermark: WatermarkConfig | None = None,
+    container: ContainerSpec | None = None,
+    naming: NamingConfig | None = None,
 ) -> list[WrittenSegment]:
     """一次性切出全部分片，并逐片复测实际时长与文件大小。
 
@@ -184,17 +212,24 @@ def write_all_segments(
     传入 :class:`WatermarkConfig` 时切换到"重编码视频 + overlay 水印"
     分支：先自行栅格化文字为 PNG，再走带 ``-force_key_frames`` 的
     重编码 segment 命令；为 ``None`` 时与历史行为完全一致（流拷贝）。
+    容器与命名配置对两条分支同样生效。
     """
+    spec = container if container is not None else get_container(DEFAULT_CONTAINER)
+    if naming is None:
+        naming = NamingConfig(
+            name_prefix=filename_prefix, extension=spec.extension
+        )
+
     if watermark is None:
         argv = build_segmentation_command(
-            media, planned, output_dir, filename_prefix, maps
+            media, planned, output_dir, filename_prefix, maps, spec, naming
         )
     else:
         watermark_png = os.path.join(output_dir, WATERMARK_PNG_FILENAME)
         render_text_png(watermark, watermark_png)
         argv = build_watermarked_segment_command(
             media, planned, output_dir, filename_prefix, maps,
-            watermark_png, watermark,
+            watermark_png, watermark, spec, naming,
         )
 
     # 整文件处理，超时按源时长估算（重编码比流拷贝慢，水印分支放宽 3 倍）

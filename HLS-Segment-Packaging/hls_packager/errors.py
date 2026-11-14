@@ -41,6 +41,10 @@ class WatermarkError(PackagerError):
     """文字水印的渲染参数、字体或叠加过程出错。"""
 
 
+class NamingError(PackagerError):
+    """分片命名模板非法或渲染出的文件名冲突 / 含禁用字符。"""
+
+
 class EncryptionError(PackagerError):
     """AES-128 分片加密的参数或执行过程出错。
 
