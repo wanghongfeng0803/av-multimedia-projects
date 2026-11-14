@@ -304,6 +304,108 @@ def build_multi_track_mp4(tracks: Sequence[dict]) -> bytes:
     return _ftyp() + moov + box("mdat", mdat_payload)
 
 
+def build_chpl(entries: Sequence[tuple], *, fullbox_chpl: bool = True) -> bytes:
+    """构造一个 chpl 盒（Apple/ISO 章节清单）。
+
+    :param entries: ``(start_time, title)`` 元组序列，start_time 为
+        movie timescale 单位的整数，title 为 str（按 UTF-8 编码，
+        长度不超过 255，与真实 ffmpeg/GPAC 一致使用单字节长度）。
+    :param fullbox_chpl: True 时 chpl 带 FullBox 头（标准布局）；
+        False 时省略 4 字节 version/flags（历史变体）。
+    """
+    payload = b"\x00" + pack(">I", len(entries))  # reserved + chapter_count
+    for start_time, title in entries:
+        title_bytes = title.encode("utf-8")
+        if len(title_bytes) > 255:
+            raise ValueError("chpl 章节标题最长 255 字节（单字节长度字段）")
+        # 标题长度为 uint8 Pascal 风格字段，与 ffmpeg/AtomicParsley 布局一致
+        payload += pack(">Q", start_time) + bytes([len(title_bytes)]) + title_bytes
+    if fullbox_chpl:
+        return fullbox("chpl", 0, 0, payload)
+    return box("chpl", payload)
+
+
+def build_chapter_udta(
+    entries: Sequence[tuple],
+    *,
+    fullbox_meta: bool = True,
+    fullbox_chpl: bool = True,
+    extra_wrappers: Sequence[str] = (),
+) -> bytes:
+    """构造 moov 子级的 ``udta`` 章节容器。
+
+    默认布局 ``udta/meta/chpl``；``extra_wrappers`` 可在 meta 与 chpl
+    之间再裹任意容器盒（如 ``("gnre", "ilst")``），用于测试多层嵌套。
+    """
+    inner = build_chpl(entries, fullbox_chpl=fullbox_chpl)
+    for kind in reversed(extra_wrappers):
+        inner = box(kind, inner)
+    meta = fullbox("meta", 0, 0, inner) if fullbox_meta else box("meta", inner)
+    return box("udta", meta)
+
+
+def inject_moov_child(mp4_bytes: bytes, child: bytes) -> bytes:
+    """把一个盒（通常是 udta）注入 moov 末尾，并同步放大 moov 长度。
+
+    纯字节级操作，不重建样本表：先定位 ``moov`` 四字符码，改写其
+    32 位 size 后把 child 插到 moov 负载尾部。注入会使 moov 之后的
+    mdat 整体后移 ``len(child)`` 字节，因此同步给所有 stco/co64 块
+    偏移表加上该位移，保证样本绝对偏移仍然有效。
+    """
+    marker = b"moov"
+    pos = mp4_bytes.find(marker)
+    if pos < 4:
+        raise ValueError("字节流中找不到 moov 盒")
+    size_pos = pos - 4
+    moov_size = int.from_bytes(mp4_bytes[size_pos:pos], "big")
+    if moov_size < 8 or size_pos + moov_size > len(mp4_bytes):
+        raise ValueError("moov 盒长度非法")
+    delta = len(child)
+    new_size = moov_size + delta
+
+    result = bytearray(
+        mp4_bytes[:size_pos]
+        + new_size.to_bytes(4, "big")
+        + mp4_bytes[pos:size_pos + moov_size]
+        + child
+        + mp4_bytes[size_pos + moov_size:]
+    )
+    _shift_chunk_offsets(result, delta)
+    return bytes(result)
+
+
+def _shift_chunk_offsets(buf: bytearray, delta: int) -> None:
+    """给字节流中所有 stco(32 位)/co64(64 位) 偏移表项加上 delta。
+
+    通过“声明盒长 == 头部 + 计数×项宽”的自洽校验排除四字符码的
+    偶然命中，仅改写结构合法的偏移表。
+    """
+    for fourcc, width in ((b"stco", 4), (b"co64", 8)):
+        search_from = 0
+        while True:
+            hit = buf.find(fourcc, search_from)
+            if hit < 4:
+                break
+            search_from = hit + 4
+            box_size_pos = hit - 4
+            declared_size = int.from_bytes(
+                buf[box_size_pos:box_size_pos + 4], "big"
+            )
+            # fullbox 头 4 + entry_count 4，计数项位于 fourcc 之后 4 字节
+            count_pos = hit + 8
+            if count_pos + 4 > len(buf):
+                continue
+            count = int.from_bytes(buf[count_pos:count_pos + 4], "big")
+            expected_size = 8 + 4 + 4 + count * width
+            if declared_size != expected_size:
+                continue  # 偶然命中或非标准表，跳过不动
+            entry_pos = count_pos + 4
+            for i in range(count):
+                p = entry_pos + i * width
+                old = int.from_bytes(buf[p:p + width], "big")
+                buf[p:p + width] = (old + delta).to_bytes(width, "big")
+
+
 def build_mp4(
     frames: Sequence[bytes],
     *,

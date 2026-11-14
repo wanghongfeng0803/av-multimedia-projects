@@ -89,14 +89,23 @@ def _wrap(element_id: int, payload: bytes) -> bytes:
     return encode_element_id(element_id) + encode_vint(len(payload)) + payload
 
 
-def uint_element(element_id: int, value: int) -> bytes:
-    """无符号整数元素，按最短大端字节存储（value=0 时数据区为空）。"""
+def uint_element(element_id: int, value: int, *, min_bytes: int = 0) -> bytes:
+    """无符号整数元素，按最短大端字节存储（value=0 时数据区为空）。
+
+    :param min_bytes: 强制数据区至少占用的字节数。EBML 规范允许零值用
+        空数据区表达，但 Matroska 的某些**必需**元素（如 ChapterAtom 的
+        ChapterTimeStart/ChapterTimeEnd）被 libavformat 以“零长度即值
+        缺失”处理，会导致整个章节被丢弃；对这类元素传 ``min_bytes=1``
+        可把 0 显式写为单字节 ``0x00``。默认 0 保持其余元素的历史字节。
+    """
     if value < 0:
         raise EbmlEncodeError(f"无符号整数元素不能为负: {value}")
     if value == 0:
-        payload = b""
+        payload = b"\x00" * min_bytes
     else:
         payload = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        if len(payload) < min_bytes:
+            payload = payload.rjust(min_bytes, b"\x00")
     return _wrap(element_id, payload)
 
 

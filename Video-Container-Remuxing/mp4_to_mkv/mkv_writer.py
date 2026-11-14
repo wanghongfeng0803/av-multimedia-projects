@@ -265,7 +265,7 @@ def _build_info(duration_ms: float) -> bytes:
     return ebml.master_element(INFO, children)
 
 
-def _build_chapters(chapters: List[Chapter]) -> bytes:
+def _build_chapters(chapters: List[Chapter], duration_ms: float) -> bytes:
     """把 chpl 章节清单编码为 Matroska Chapters 主元素。
 
     结构（单个 EditionEntry 容纳全部章节，MP4 chpl 本身是单层清单）::
@@ -275,17 +275,29 @@ def _build_chapters(chapters: List[Chapter]) -> bytes:
             EditionFlagHidden=0 / EditionFlagDefault=1
             ChapterAtom × N
               ChapterUID（确定性：取章节在归一化清单中的 1 起始序号）
-              ChapterTimeStart（纳秒；chpl 无结束时间，不写 ChapterTimeEnd）
+              ChapterTimeStart（纳秒；来自 chpl 起始时间）
+              ChapterTimeEnd（纳秒；下一章起点，末章取影片时长）
               ChapterFlagHidden=0 / ChapterFlagEnabled=1
               ChapterDisplay
                 ChapString（标题，UTF-8）
                 ChapLanguage="und"（chpl 不携带语言标签）
 
+    chpl 只携带起始时间，而 Matroska 生态（libavformat/mkvmerge）要求
+    每章带 ChapterTimeEnd，否则部分解复用器会丢弃起始为 0 的首章；
+    因此用“下一章起点”补齐，末章结束时间取影片总时长。
+
     ChapterUID 取序号而非哈希，使同一输入在任意机器、任意次数下
     产出逐字节一致的输出（可复现性）。
     """
+    duration_ns = round(duration_ms * 1_000_000)
     atoms: List[bytes] = []
+    count = len(chapters)
     for index, chapter in enumerate(chapters, start=1):
+        # 结束时间：优先取下一章起点；末章回退到影片时长，并保证不早于起点
+        if index < count:
+            end_ns = max(chapter.start_ns, chapters[index].start_ns)
+        else:
+            end_ns = max(chapter.start_ns, duration_ns)
         display = ebml.master_element(
             CHAPTER_DISPLAY,
             [
@@ -295,7 +307,10 @@ def _build_chapters(chapters: List[Chapter]) -> bytes:
         )
         atom_children = [
             ebml.uint_element(CHAPTER_UID, index),
-            ebml.uint_element(CHAPTER_TIME_START, chapter.start_ns),
+            # 时间戳是 ChapterAtom 必需元素：0 必须显式写为单字节 0x00，
+            # 否则 libavformat 把零长度数据当作“值缺失”而丢弃整个章节
+            ebml.uint_element(CHAPTER_TIME_START, chapter.start_ns, min_bytes=1),
+            ebml.uint_element(CHAPTER_TIME_END, end_ns, min_bytes=1),
             ebml.uint_element(CHAPTER_FLAG_HIDDEN, 0),
             ebml.uint_element(CHAPTER_FLAG_ENABLED, 1),
             display,
@@ -547,7 +562,9 @@ def write_mkv(mp4: Mp4File) -> bytes:
     # 章节（chpl）作为 Segment 级主元素，位于 Tracks 之后、Cluster 之前；
     # 无章节时不产生任何字节，输出与旧版本逐字节一致（除 WritingApp 版本号）
     chapters = (
-        _build_chapters(mp4.chapters) if getattr(mp4, "chapters", None) else b""
+        _build_chapters(mp4.chapters, duration_ms)
+        if getattr(mp4, "chapters", None)
+        else b""
     )
     clusters = _build_clusters(mp4, placed)
 

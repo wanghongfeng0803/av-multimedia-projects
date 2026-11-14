@@ -19,6 +19,17 @@
 - **字幕完整保留**：TTML 样本（完整 XML 文档）直拷；WebVTT 的 `vttc` 盒
   重组为 Matroska `S_TEXT/WEBVTT`，cue 正文入 Block，cue id/settings 经
   `BlockAdditions`（BlockAddID 1/2）保留，空 cue（`vtte`）也不丢。
+- **章节（chapter）元数据字节级保留**：解析 `moov/udta/meta/chpl` 章节清单，
+  转写为 Matroska `Chapters`（EditionEntry/ChapterAtom/ChapterDisplay）。
+  - 多层嵌套（`gnre`/`ilst` 等容器）与 FullBox/普通盒两种 `meta` 布局均能定位；
+  - 兼容真实 ffmpeg/GPAC 的 **100ns 事实时间单位**（自动识别）与 movie
+    timescale 规范单位，时间戳精确换算为纳秒；标题长度按 uint8 Pascal 风格解析；
+  - 容错损坏/不规则输入：负载与标题截断按可用字节恢复、计数不符以实际为准、
+    非法 UTF-8 替换解码、空标题回退确定性占位名，且章节解析失败绝不影响媒体；
+  - 每章带 `ChapterTimeEnd`，零时间戳显式编码（避免 libavformat 丢弃首章），
+    ChapterUID 取归一化序号，同一输入反复处理**逐字节可复现**；
+  - 同时存在的 QuickTime 章节文本轨（`handler=text` + `gmhd`）被识别并跳过，
+    不再因不支持文本编码而拒绝整个文件。
 - **多轨道交织**：轨道排列固定为 视频 → 音频 → 字幕，同类保持源顺序，
   跨轨道按归一化 DTS（精确分数）排序；每类首轨为默认轨，语言码透传。
 - **容错与清晰报错**：对损坏盒结构、越界偏移、计数不一致等给出中文提示；

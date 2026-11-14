@@ -297,6 +297,66 @@ class FfmpegIntegrationTests(unittest.TestCase):
             self._framemd5_hashes(dst, "a"),
         )
 
+    def _gen_chapter_mp4(self, name: str) -> Path:
+        """用 FFMETADATA1 章节清单生成含 chpl（及 QuickTime 章节文本轨）的 MP4。
+
+        标题用纯 ASCII：Windows 中文区域下 subprocess 文本模式按 GBK 解码，
+        非 ASCII 标题会令 ffprobe 输出触发 UnicodeDecodeError；UTF-8 多字节
+        标题的逐字节保留已由 tests/test_chapters.py 的单元测试覆盖。
+        """
+        meta = self.dir / "chapters.meta"
+        meta.write_text(
+            ";FFMETADATA1\n"
+            "[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=Intro\n"
+            "[CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=4000\ntitle=Main\n"
+            "[CHAPTER]\nTIMEBASE=1/1000\nSTART=4000\nEND=5000\ntitle=Outro\n",
+            encoding="utf-8",
+        )
+        src = self.dir / name
+        # 章节元数据作为第三个输入并 -map_metadata；-t 5 置于输出侧
+        run(
+            f'-y -f lavfi -i testsrc=size=160x120:rate=10 '
+            f'-f lavfi -i sine=frequency=440 '
+            f'-i "{meta}" -map 0:v -map 1:a -map_metadata 2 '
+            f'-c:v libx264 -preset ultrafast -c:a aac -t 5 "{src}"'
+        )
+        return src
+
+    def _chapters(self, path: Path) -> list:
+        """用 ffprobe 提取 (start_seconds, title) 列表。"""
+        out = run(
+            f'{FFPROBE} -v error -show_chapters -of json "{path}"'
+        ).stdout
+        return [
+            (float(c["start_time"]), c["tags"]["title"])
+            for c in json.loads(out)["chapters"]
+        ]
+
+    def test_chapters_preserved_end_to_end(self):
+        """真实 ffmpeg 文件：chpl 章节完整转写，含 start=0 的首章。"""
+        src = self._gen_chapter_mp4("chap.mp4")
+        dst = self._remux(src)
+
+        expected = [(0.0, "Intro"), (2.0, "Main"), (4.0, "Outro")]
+        # 源与输出的章节完全一致（含起始为 0 的首章——回归零值非空编码）
+        self.assertEqual(self._chapters(src), expected)
+        self.assertEqual(self._chapters(dst), expected)
+
+        # 章节文本轨被跳过，输出只含视频与音频两条媒体流
+        streams = run(
+            f'{FFPROBE} -v error -show_entries stream=codec_type '
+            f'-of csv=p=0 "{dst}"'
+        ).stdout.split()
+        self.assertEqual(sorted(streams), ["audio", "video"])
+
+        # 媒体内容仍然逐比特无损
+        self.assertEqual(
+            self._framemd5_hashes(src, "v"), self._framemd5_hashes(dst, "v")
+        )
+        self.assertEqual(
+            self._framemd5_hashes(src, "a"), self._framemd5_hashes(dst, "a")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

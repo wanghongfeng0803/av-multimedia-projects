@@ -6,15 +6,20 @@ MP4/MOV 容器的章节有两套并存的表达：
    作为文本样本，由 ``trak`` 的章节引用（``chap``）关联到其它轨道——属于
    媒体轨范畴，本项目基础版本不支持文本轨；
 2. **``chpl`` 章节清单盒**（Apple/ISO 风格，本模块解析对象）：位于
-   ``moov/udta/meta/chpl``，是一份扁平的 (起始时间, 标题) 清单，结构为::
+   ``moov/udta/meta/chpl`` 或直接 ``moov/udta/chpl``，是一份扁平的
+   (起始时间, 标题) 清单，结构为::
 
-       chpl (FullBox: version/flags 各 1 字节，version 恒为 0)
+       chpl (FullBox: version/flags；ffmpeg 实际写 version=1)
          reserved        1 字节（恒 0）
          chapter_count   uint32 BE
          chapter × N:
            start_time    uint64 BE   —— 单位为 mvhd 的 movie timescale
-           title_length  uint16 BE
-           title         UTF-8 字节（长度即 title_length）
+           title_length  uint8 BE    —— 单字节 Pascal 风格长度
+           title         UTF-8 字节（长度即 title_length，最长 255）
+
+   注意标题长度字段是 **1 字节 uint8**：这是 ffmpeg / AtomicParsley /
+   GPAC 等主流封装器共同遵循的事实布局（早期资料偶有 uint16 误传，
+   会把 ``05 49`` 这类“长度+首字符”误读成 1353）。
 
 本模块的设计目标是**在任何输入下都给出健壮、确定、可复现的结果**：
 
@@ -51,9 +56,6 @@ _MAX_CHPL_PAYLOAD = 64 * 1024 * 1024  # 单个 chpl 负载 64 MiB 上限
 _MAX_CHAPTERS = 100_000         # 单个/聚合后的章节总数上限
 _MAX_DFS_DEPTH = 16             # 最大递归深度（真实嵌套不超过个位数）
 
-# 容器型盒：其负载按子盒序列继续下钻
-_CONTAINER_KINDS = {"udta", "meta", "gnre", "ilst", "----"}
-
 
 @dataclass(frozen=True)
 class Chapter:
@@ -87,6 +89,7 @@ def _lenient_children(box: Box) -> List[Box]:
 def _resync_boxes(buf: bytes, base_offset: int) -> List[Box]:
     """在损坏的同级盒缓冲区中扫描恢复合法盒。
 
+    盒头布局为 ``size(4) + type(4)``：四字符码位于起始位置 +4。
     判定一个位置是合法盒头的条件：四字符码可打印、声明长度自洽
     （不短于盒头且不越出缓冲区）。扫描步长为 1，仅在严格解析失败的
     错误路径上执行，正常文件不会进入此函数。
@@ -95,7 +98,7 @@ def _resync_boxes(buf: bytes, base_offset: int) -> List[Box]:
     n = len(buf)
     pos = 0
     while pos + 8 <= n:
-        kind = _try_printable_fourcc(buf, pos)
+        kind = _try_printable_fourcc(buf, pos + 4)
         if kind is None:
             pos += 1
             continue
@@ -129,8 +132,7 @@ def _try_printable_fourcc(buf: bytes, pos: int) -> Optional[str]:
         return None
     raw = buf[pos:pos + 4]
     if all(0x20 <= b < 0x7F for b in raw):
-        kind = raw.decode("latin-1")
-        return kind
+        return raw.decode("latin-1")
     return None
 
 
@@ -171,11 +173,17 @@ def _lenient_parse(buf: bytes, base_offset: int) -> List[Box]:
 # ---------------------------------------------------------------------------
 
 def _find_chpl_boxes(root: Box) -> List[Box]:
-    """在盒树中有界深度优先搜索全部 ``chpl`` 盒（文档顺序）。"""
+    """在盒树中有界深度优先搜索全部 ``chpl`` 盒（文档顺序）。
+
+    开销控制：``udta`` 是厂商自由扩展区，负载小且最易损坏，其整棵
+    子树启用“严格解析 + 逐字节重同步”的完整容错；``udta`` 之外（样本
+    表等可能达数 MB 的盒）只做**严格探测**，解析失败即视为叶子，
+    避免对大负载执行 O(n) 重同步扫描。
+    """
     found: List[Box] = []
     nodes = 0
 
-    def walk(box: Box, depth: int) -> None:
+    def walk(box: Box, depth: int, lenient: bool) -> None:
         nonlocal nodes
         nodes += 1
         if nodes > _MAX_TRAVERSE_NODES or depth > _MAX_DFS_DEPTH:
@@ -184,19 +192,30 @@ def _find_chpl_boxes(root: Box) -> List[Box]:
             found.append(box)
             # chpl 是叶子数据盒，不再下钻（也防止把其数据误解析为盒）
             return
+
         if box.kind == "meta":
             children = _meta_payload_children(box)
-        elif box.kind in _CONTAINER_KINDS:
+        elif lenient:
             children = _lenient_children(box)
         else:
-            # 未知盒也尝试下钻：udta 厂商扩展区存在大量非标准容器，
-            # 严格盒解析失败时 _lenient_children 会自动重同步
-            children = _lenient_children(box)
-        for child in children:
-            walk(child, depth + 1)
+            children = _strict_children(box)
 
-    walk(root, 0)
+        # 进入 udta / meta 后，整棵子树切换到完整容错模式：
+        # 二者都是元数据区，负载小且厂商变体多，重同步成本可忽略
+        child_lenient = lenient or box.kind in ("udta", "meta")
+        for child in children:
+            walk(child, depth + 1, child_lenient)
+
+    walk(root, 0, False)
     return found
+
+
+def _strict_children(box: Box) -> List[Box]:
+    """严格子盒解析：任何结构异常都返回空列表（把该盒视为叶子）。"""
+    try:
+        return box.children()
+    except RemuxError:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +284,13 @@ def _parse_chpl_layout(
     pos = 5
     truncated = False
     while len(entries) < declared_count:
-        # start_time(8) + title_length(2) 至少 10 字节
-        if pos + 10 > len(body):
+        # start_time(8) + title_length(1) 至少 9 字节
+        if pos + 9 > len(body):
             truncated = True
             break
         start_time = unpack(">Q", body[pos:pos + 8])[0]
-        title_len = unpack(">H", body[pos + 8:pos + 10])[0]
-        pos += 10
+        title_len = body[pos + 8]  # uint8：标题长度为单字节 Pascal 风格
+        pos += 9
         title_end = pos + title_len
         if title_end > len(body):
             # 标题被截断：按可用字节恢复，这是损坏文件能保留的最后信息
@@ -325,32 +344,79 @@ def _decode_title(raw: bytes) -> str:
 # 顶层提取与归一化
 # ---------------------------------------------------------------------------
 
-def _to_nanoseconds(start_time: int, timescale: int) -> int:
-    """把 movie timescale 单位的时间戳换算为纳秒（四舍五入，非负钳制）。"""
+# ffmpeg / GPAC / AtomicParsley 的 chpl 时间戳事实单位：100 纳秒（10 MHz）。
+# 规范文本虽称“movie timescale 单位”，但主流开源工具统一写 100ns 绝对值。
+_CHPL_100NS_TICKS_PER_SEC = 10_000_000
+
+
+def _to_nanoseconds(start_time: int, ticks_per_sec: int) -> int:
+    """把给定时间基（每秒 tick 数）的时间戳换算为纳秒（四舍五入，非负钳制）。"""
     if start_time < 0:  # u64 理论上无负数，防御性处理
         return 0
-    return (start_time * 1_000_000_000 + timescale // 2) // timescale
+    return (start_time * 1_000_000_000 + ticks_per_sec // 2) // ticks_per_sec
+
+
+def _choose_chpl_timebase(
+    max_start: int, movie_timescale: int, movie_duration_seconds: Optional[float]
+) -> Tuple[int, Optional[str]]:
+    """在“100ns 事实单位”与“movie timescale 规范单位”间确定性择优。
+
+    背景：chpl 的 start_time 存在两种真实来源——
+
+    - ffmpeg/GPAC/AtomicParsley 写 **100ns 绝对单位**（10 MHz tick，
+      每秒 1e7）；
+    - 严格遵循早期 Apple 文档的工具写 **movie timescale 单位**
+      （每秒 tick 数 = mvhd timescale，常见 24k/44.1k/48k）。
+
+    二者相差约两个数量级。用“末章 tick ÷ 影片时长”估算章节时间戳的
+    实际每秒密度：只有当它明显落在 movie timescale 的 2 倍区间内、
+    且与 10 MHz 相差 10 倍以上时才切换到 movie timescale（强证据），
+    其余情况一律采用主流事实标准 100ns，避免在证据不足时误判。
+
+    :return: (选中的 ticks_per_sec, 诊断消息或 None)。
+    """
+    if (
+        movie_duration_seconds
+        and movie_duration_seconds > 0
+        and max_start > 0
+        and movie_timescale > 0
+    ):
+        observed_tps = max_start / movie_duration_seconds
+        near_movie_ts = (
+            movie_timescale / 2 <= observed_tps <= movie_timescale * 2
+        )
+        far_from_100ns = observed_tps * 10 < _CHPL_100NS_TICKS_PER_SEC
+        if near_movie_ts and far_from_100ns:
+            return (
+                movie_timescale,
+                "检测到 chpl 时间戳采用 movie timescale 单位（非 100ns 事实标准）",
+            )
+    # 缺时长参照或证据不足：采用主流事实标准 100ns
+    return _CHPL_100NS_TICKS_PER_SEC, None
 
 
 def extract_chapters(
-    moov: Box, movie_timescale: Optional[int]
+    moov: Box,
+    movie_timescale: Optional[int],
+    movie_duration_seconds: Optional[float] = None,
 ) -> Tuple[List[Chapter], List[str]]:
     """从 moov 盒树提取并归一化章节清单。
 
     :param moov: 已解析的 ``moov`` 盒。
     :param movie_timescale: ``mvhd`` 中的 movie timescale；无法取得时
-        回退为 1（时间戳按原始数值×1e9 解释）并记录诊断。
+        回退为 100ns 事实单位并记录诊断。
+    :param movie_duration_seconds: mvhd 影片时长（秒），用于在 100ns 与
+        movie timescale 两种 chpl 时间单位间做有界判定；未知则传 None。
     :return: (章节列表, 诊断信息列表)。章节列表按起始时间稳定排序、
         同时间同标题去重，UID 顺序由列表位置决定，结果完全确定。
         任何输入下都不抛异常。
     """
     warnings: List[str] = []
-    timescale = movie_timescale
-    if not timescale or timescale <= 0:
+    if not movie_timescale or movie_timescale <= 0:
         warnings.append(
-            "无法取得合法的 mvhd timescale，章节时间戳按原始数值解释（单位未知）"
+            "无法取得合法的 mvhd timescale，章节时间戳按 100ns 事实单位解释"
         )
-        timescale = 1
+        movie_timescale = _CHPL_100NS_TICKS_PER_SEC
 
     try:
         chpl_boxes = _find_chpl_boxes(moov)
@@ -372,11 +438,19 @@ def extract_chapters(
     if not raw_entries:
         return [], warnings
 
+    # 依据最后一个章节落点，在 100ns 事实单位与 movie timescale 间自适应选择
+    max_start = max(start_time for start_time, _t, _w in raw_entries)
+    ticks_per_sec, timebase_warning = _choose_chpl_timebase(
+        max_start, movie_timescale, movie_duration_seconds
+    )
+    if timebase_warning:
+        warnings.append(timebase_warning)
+
     # 归一化：时间换算 → 稳定排序 → (start_ns, 标题) 去重。
     # 多个 chpl 盒（重复封装/厂商冗余）由此合并为一份确定清单。
     normalized = [
         (
-            _to_nanoseconds(start_time, timescale),
+            _to_nanoseconds(start_time, ticks_per_sec),
             title,
             entry_warnings,
         )

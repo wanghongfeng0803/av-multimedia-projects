@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from struct import unpack
 from typing import List, Optional, Tuple
 
-from .chapters import Chapter, extract_chapters
+from . import chapters as _chapters
 from .errors import RemuxError
 
 # 支持的 sample entry 四字符码 → 编码族
@@ -200,7 +200,7 @@ def _parse_mdhd(mdhd: Box) -> Tuple[int, int]:
 
 
 def _parse_mvhd_timescale(mvhd: Box) -> Optional[int]:
-    """读取 mvhd 的 movie timescale（chpl 章节时间戳的单位）。
+    """读取 mvhd 的 movie timescale（chpl 章节时间戳的参照单位）。
 
     与 mdhd 同构：FullBox 头之后，v0 布局为
     creation(4)+modification(4)+timescale(4)+duration(4)，timescale 在
@@ -216,6 +216,31 @@ def _parse_mvhd_timescale(mvhd: Box) -> Optional[int]:
     except RemuxError:
         return None
     return timescale if timescale > 0 else None
+
+
+def _parse_mvhd_duration_seconds(mvhd: Box) -> Optional[float]:
+    """读取 mvhd 影片时长（秒），用于章节时间戳单位的有界判定。
+
+    v0 duration 为 uint32（timescale 之后 4 字节）；v1 为 uint64
+    （timescale 之后 8 字节）。任何字段缺失或非法都返回 None。
+    """
+    try:
+        version, _ = _parse_full_box_header(mvhd.data)
+        if version == 1:
+            ts_off, dur_off, dur_len = 20, 24, 8
+        else:
+            ts_off, dur_off, dur_len = 12, 16, 4
+        if len(mvhd.data) < dur_off + dur_len:
+            return None
+        timescale = unpack(">I", mvhd.data[ts_off:ts_off + 4])[0]
+        duration = int.from_bytes(
+            mvhd.data[dur_off:dur_off + dur_len], "big"
+        )
+        if timescale <= 0:
+            return None
+        return duration / timescale
+    except RemuxError:
+        return None
 
 
 def _parse_mdhd_language(mdhd: Box) -> str:
@@ -660,6 +685,33 @@ def _parse_elst(trak: Box) -> Tuple[bool, int, int]:
     return True, media_time, segment_duration
 
 
+def _is_quicktime_chapter_track(trak: Box) -> bool:
+    """判断 trak 是否为 QuickTime 章节文本轨（非媒体轨，可安全跳过）。
+
+    真实文件（如 ffmpeg 产出）会同时写 ``chpl`` 盒与一条章节文本轨：
+    其 ``mdia/hdlr`` 的 handler 为 ``text``，媒体信息头是通用
+    ``minf/gmhd``（而非 vmhd/smhd/sthd），章节标题作为该轨的文本样本。
+    章节内容已由 ``chpl`` 完整承载，因此识别到此特征即跳过，避免因
+    不支持文本编码而拒绝整个文件。任何结构缺失都返回 False，交由
+    常规路径处理（不支持时仍明确报错），不做过度猜测。
+    """
+    try:
+        mdia = _find_child(trak, "mdia")
+        if mdia is None:
+            return False
+        hdlr = _find_child(mdia, "hdlr")
+        if hdlr is None or len(hdlr.data) < 12:
+            return False
+        if _fourcc(hdlr.data[8:12]) != "text":
+            return False
+        minf = _find_child(mdia, "minf")
+        if minf is None:
+            return False
+        return _find_child(minf, "gmhd") is not None
+    except RemuxError:
+        return False
+
+
 def _parse_trak(trak: Box, file_size: int) -> Track:
     mdia = _require_child(trak, "mdia")
     mdhd = _require_child(mdia, "mdhd")
@@ -842,10 +894,12 @@ class Mp4File:
 
     def __init__(self, data: bytes):
         self._data = data
-        self.tracks: List[Track] = []
-        # 章节（chpl）元数据与解析诊断；无章节时为空列表，不影响既有行为
-        self.chapters: List[Chapter] = []
+        self.tracks: List["Track"] = []
+                # 章节（chpl）元数据与解析诊断；无章节时为空列表，不影响既有行为
+        self.chapters: List["_chapters.Chapter"] = []
         self.chapter_warnings: List[str] = []
+        # 被识别并跳过的非媒体轨（如 QuickTime 章节文本轨）的可读描述
+        self.skipped_tracks: List[str] = []
         self._parse()
 
     @property
@@ -878,6 +932,12 @@ class Mp4File:
             raise RemuxError("moov 中没有任何 trak 盒")
 
         for index, trak in enumerate(traks, start=1):
+            if _is_quicktime_chapter_track(trak):
+                # QuickTime 章节文本轨（handler=text + minf/gmhd）是已知的
+                # 非媒体轨：其章节信息已由 moov/udta/meta/chpl 承载，跳过
+                # 不报错，保证含章节轨的真实文件能正常重封装媒体与章节。
+                self.skipped_tracks.append("text/gmhd 章节轨")
+                continue
             track = _parse_trak(trak, len(self._data))
             track.track_id = index
             self.tracks.append(track)
@@ -888,8 +948,11 @@ class Mp4File:
         movie_timescale = (
             _parse_mvhd_timescale(mvhd) if mvhd is not None else None
         )
-        self.chapters, self.chapter_warnings = extract_chapters(
-            moov, movie_timescale
+        movie_duration_seconds = (
+            _parse_mvhd_duration_seconds(mvhd) if mvhd is not None else None
+        )
+        self.chapters, self.chapter_warnings = _chapters.extract_chapters(
+            moov, movie_timescale, movie_duration_seconds
         )
 
     @staticmethod
