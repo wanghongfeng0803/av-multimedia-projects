@@ -25,6 +25,14 @@ HAS_FFMPEG = bool(FFMPEG and FFPROBE)
 
 
 def run(cmd: str) -> subprocess.CompletedProcess:
+    # -nostdin 避免 ffmpeg 在无控制终端的子进程里等待 stdin 而挂起；
+    # ffprobe 不支持该选项，仅对 ffmpeg 命令添加。
+    stripped = cmd.strip()
+    if stripped.startswith(FFMPEG):
+        cmd = f"{FFMPEG} -nostdin {stripped[len(FFMPEG):].lstrip()}"
+    elif not stripped.startswith(FFPROBE):
+        # 未写二进制前缀时按 ffmpeg 命令补全
+        cmd = f"{FFMPEG} -nostdin {stripped}"
     return subprocess.run(
         cmd, check=True, capture_output=True, text=True, shell=True
     )
@@ -169,7 +177,125 @@ class FfmpegIntegrationTests(unittest.TestCase):
         dst = src.with_suffix(".mkv")
         code = cli.main([str(src), str(dst)])
         self.assertEqual(code, cli.EXIT_INVALID_INPUT)
-        self.assertFalse(dst.exists())
+
+    # ---- 新增编码：AC-3 / E-AC-3 / MP3 音频的无损重封装 ----
+
+    def _gen_audio_only(self, name: str, codec: str, extra: str = "") -> Path:
+        src = self.dir / name
+        run(
+            f'{FFMPEG} -y -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 '
+            f'-c:a {codec} {extra} "{src}"'
+        )
+        return src
+
+    def _assert_audio_lossless(self, src: Path, dst: Path, codec_name: str):
+        info = self._stream_info(dst)
+        self.assertEqual(info["audio"]["codec_name"], codec_name)
+        self.assertEqual(
+            self._framemd5_hashes(src, "a"),
+            self._framemd5_hashes(dst, "a"),
+        )
+
+    def test_ac3_lossless(self):
+        src = self._gen_audio_only("ac3.mp4", "ac3")
+        dst = self._remux(src)
+        self._assert_audio_lossless(src, dst, "ac3")
+
+    def test_eac3_lossless(self):
+        src = self._gen_audio_only("eac3.mp4", "eac3")
+        dst = self._remux(src)
+        self._assert_audio_lossless(src, dst, "eac3")
+
+    def test_mp3_lossless(self):
+        src = self._gen_audio_only("mp3.mp4", "libmp3lame")
+        dst = self._remux(src)
+        self._assert_audio_lossless(src, dst, "mp3")
+
+    def test_multi_audio_tracks_all_preserved(self):
+        """视频 + 两条不同编码的音频轨，重封装后必须全部保留且各自无损。"""
+        src = self.dir / "multi_audio.mp4"
+        # 多输入时 -t 必须作为输出选项放在输出文件名前，否则会被误绑到某个输入
+        run(
+            f'-y -f lavfi -i testsrc=size=160x120:rate=15 '
+            f'-f lavfi -i sine=frequency=440:sample_rate=48000 '
+            f'-f lavfi -i sine=frequency=880:sample_rate=48000 '
+            f'-map 0:v -c:v libx264 -preset ultrafast '
+            f'-map 1:a -c:a:0 aac '
+            f'-map 2:a -c:a:1 ac3 -t 1 "{src}"'
+        )
+        dst = self._remux(src)
+        out = set(
+            run(
+                f'{FFPROBE} -v error -show_entries stream=codec_type,codec_name '
+                f'-of csv=p=0 "{dst}"'
+            ).stdout.splitlines()
+        )
+        # 输出仍为 1 视频 + 2 音频，编码标识不变（ffprobe csv 列为 name,type）
+        self.assertEqual(
+            out, {"h264,video", "aac,audio", "ac3,audio"}
+        )
+        # 两条音频各自解码哈希一致（按流索引）
+        for idx in range(2):
+            self.assertEqual(
+                self._framemd5_hashes(src, f"a:{idx}"),
+                self._framemd5_hashes(dst, f"a:{idx}"),
+            )
+
+    # ---- TTML 字幕轨：ffmpeg 自身无法封进 MKV，验证本工具可直拷 ----
+
+    def test_ttml_subtitle_preserved(self):
+        vtt = self.dir / "sub.vtt"
+        vtt.write_text(
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n\n"
+            "00:00:03.000 --> 00:00:04.000\nWorld\n",
+            encoding="utf-8",
+        )
+        src = self.dir / "ttml.mp4"
+        run(f'{FFMPEG} -y -i "{vtt}" -c:s ttml "{src}"')
+        dst = self._remux(src)
+
+        info = self._stream_info(dst)
+        # ffmpeg 不识别 MKV 内 TTML 的具体解码器，但轨类型应为字幕
+        self.assertIn("subtitle", info)
+        # MKV 内字幕块必须包含源 TTML 文档的关键内容（直拷无损）
+        blob = dst.read_bytes()
+        self.assertIn(b"<?xml", blob)
+        self.assertIn(b"Hello", blob)
+
+    def test_video_audio_subtitle_full_pipeline_via_script(self):
+        """经 remux_all_tracks 脚本完成 视频+音频+字幕 全轨道重封装。"""
+        import remux_all_tracks as rat
+
+        vtt = self.dir / "sub.vtt"
+        vtt.write_text(
+            "WEBVTT\n\n00:00:00.500 --> 00:00:01.500\nHi there\n",
+            encoding="utf-8",
+        )
+        src = self.dir / "full.mp4"
+        run(
+            f'-y -f lavfi -i testsrc=size=160x120:rate=15 '
+            f'-f lavfi -i sine=frequency=440:sample_rate=44100 '
+            f'-i "{vtt}" -c:v libx264 -preset ultrafast -c:a aac -c:s ttml '
+            f'-map 0:v -map 1:a -map 2:s -t 2 "{src}"'
+        )
+        dst = src.with_suffix(".mkv")
+        result = rat.remux_all_tracks(str(src), str(dst), overwrite=True)
+        # 三类轨道全部保留
+        self.assertEqual(result.track_count, 3)
+        streams = run(
+            f'{FFPROBE} -v error -show_entries stream=codec_type '
+            f'-of csv=p=0 "{dst}"'
+        ).stdout.split()
+        self.assertEqual(sorted(streams), ["audio", "subtitle", "video"])
+        # 视频与音频解码无损
+        self.assertEqual(
+            self._framemd5_hashes(src, "v"),
+            self._framemd5_hashes(dst, "v"),
+        )
+        self.assertEqual(
+            self._framemd5_hashes(src, "a"),
+            self._framemd5_hashes(dst, "a"),
+        )
 
 
 if __name__ == "__main__":

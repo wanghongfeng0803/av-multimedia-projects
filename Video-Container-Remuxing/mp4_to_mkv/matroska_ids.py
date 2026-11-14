@@ -45,6 +45,7 @@ CODEC_PRIVATE = 0x63A2
 CODEC_DELAY = 0x56AA       # 编解码器前导延迟（ns），用于 AAC priming
 SEEK_PRE_ROLL = 0x56BB    # 随机访问时需回退的时长（ns），AAC 取 80ms
 LANGUAGE = 0x22B59C
+FLAG_FORCED = 0x55AA       # 强制字幕标记（本工具恒为 0，保留常量备用）
 # 视频
 VIDEO = 0xE0
 PIXEL_WIDTH = 0xB0
@@ -54,6 +55,12 @@ AUDIO = 0xE1
 SAMPLING_FREQUENCY = 0xB5
 CHANNELS = 0x9F
 BIT_DEPTH = 0x6264
+
+# ---- BlockGroup 内的附加数据（WebVTT 字幕的 cue id / settings）----
+BLOCK_ADDITIONS = 0x75A1
+BLOCK_MORE = 0xA6
+BLOCK_ADD_ID = 0xEE
+BLOCK_ADDITIONAL = 0xA5
 
 # ---- Cluster ----
 TIMESTAMP = 0xE7
@@ -66,11 +73,17 @@ DISCARD_PADDING = 0x75A2
 # TrackType 取值
 TRACK_TYPE_VIDEO = 1
 TRACK_TYPE_AUDIO = 2
+TRACK_TYPE_SUBTITLE = 17
 
 # Matroska 编码标识（CodecID）
 CODEC_ID_AVC1 = "V_MPEG4/ISO/AVC"   # H.264 / AVC
 CODEC_ID_HEVC = "V_MPEGH/ISO/HEVC"  # H.265 / HEVC
 CODEC_ID_AAC = "A_AAC"              # AAC（私有数据为 AudioSpecificConfig）
+CODEC_ID_AC3 = "A_AC3"              # Dolby AC-3（无 CodecPrivate）
+CODEC_ID_EAC3 = "A_EAC3"            # Dolby Digital Plus / E-AC-3
+CODEC_ID_MP3 = "A_MPEG/L3"          # MPEG-1 Audio Layer III（MP3）
+CODEC_ID_TTML = "S_TEXT/TTML"       # TTML 字幕（样本即完整 TTML 文档）
+CODEC_ID_WEBVTT = "S_TEXT/WEBVTT"   # WebVTT 字幕
 
 # TimestampScale 的默认值：1 个时间戳单位 = 1,000,000 纳秒 = 1 毫秒
 DEFAULT_TIMESTAMP_SCALE = 1_000_000

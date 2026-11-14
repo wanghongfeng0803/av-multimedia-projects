@@ -16,15 +16,18 @@
   惯例，libavformat 亦如此），帧仍按 DTS 解码顺序写出，B 帧由块内
   编码顺序与参考关系自行表达；
 - 仅使用 SimpleBlock（非 Block+BlockGroup），关键帧通过块头部 flags
-  的 Keyframe 位标记，无需 ReferenceBlock；
+  的 Keyframe 位标记，无需 ReferenceBlock；音频尾部裁剪与字幕块则使用
+  BlockGroup（前者带 DiscardPadding，后者带 BlockDuration / BlockAdditions）；
 - 应用 MP4 edit list 的 media_time 偏移，并丢弃时间轴起点之前的
-  预卷样本（与主流工具行为一致）。
+  预卷样本（与主流工具行为一致）；
+- 字幕轨（TTML 文档直拷、WebVTT 的 vttc 重组）与视频/音频统一按 DTS 交织，
+  轨道排列固定为 视频 → 音频 → 字幕。
 """
 
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import List, Sequence
 
@@ -32,13 +35,14 @@ from . import ebml
 from .errors import RemuxError
 from .matroska_ids import *  # noqa: F401,F403  本模块大量使用元素 ID 常量
 from .mp4_parser import Mp4File, Sample, Track
+from .webvtt import BLOCK_ADD_ID_IDENTIFIER, BLOCK_ADD_ID_SETTINGS, convert_sample
 
 # Cluster 切分参数
 _TARGET_CLUSTER_SIZE = 5 * 1024 * 1024   # 达到该大小后在下一个视频关键帧切分
 _HARD_CLUSTER_SIZE = 100 * 1024 * 1024   # 硬上限：即使没有关键帧也强制切分
 _BLOCK_TC_MIN, _BLOCK_TC_MAX = -32768, 32767  # SimpleBlock 相对时间码范围
 
-_WRITING_APP = "mp4-to-mkv-remuxer 0.1.0"
+_WRITING_APP = "mp4-to-mkv-remuxer 0.2.0"
 
 
 @dataclass
@@ -51,8 +55,13 @@ class _PlacedSample:
     duration_ms: int    # 样本时长（毫秒）
     dts_time: Fraction  # 归一化后的 DTS（秒），用于跨 track 精确排序
     is_video: bool
+    is_subtitle: bool = False
     # 末尾需裁剪的时长（纳秒），>0 时该块用 BlockGroup+DiscardPadding 表达
     discard_padding_ns: int = 0
+    # WebVTT 字幕的块附加数据（cue id / settings），非空时用 BlockGroup 表达
+    block_additions: list = field(default_factory=list)
+    # WebVTT 转换后的块负载；为 None 时簇构建阶段按偏移从源缓冲切片
+    frame_override: bytes | None = None
 
 
 def _round_div(numerator: int, denominator: int) -> int:
@@ -103,22 +112,48 @@ def _build_block_data(
     )
 
 
+def _build_block_additions(additions: list) -> bytes:
+    """构造 BlockAdditions 主元素。
+
+    :param additions: (BlockAddID, 附加数据字节) 元组列表，
+        WebVTT 中 1=cue identifier、2=cue settings。
+    """
+    block_mores = [
+        ebml.master_element(
+            BLOCK_MORE,
+            [
+                ebml.uint_element(BLOCK_ADD_ID, add_id),
+                ebml.binary_element(BLOCK_ADDITIONAL, data),
+            ],
+        )
+        for add_id, data in additions
+    ]
+    return ebml.master_element(BLOCK_ADDITIONS, block_mores)
+
+
 def _build_block_group(
     track_number: int,
     relative_timecode_ms: int,
     frame: bytes,
     duration_ms: int,
     discard_padding_ns: int,
+    additions: list | None = None,
 ) -> bytes:
-    """构造带 DiscardPadding 的 BlockGroup（用于 AAC 尾部填充裁剪）。"""
+    """构造 BlockGroup：AAC 尾部裁剪用 DiscardPadding，字幕用 BlockAdditions。
+
+    两类附加信息都需要显式 BlockDuration 表达该块的呈现时长。
+    """
     children = [
         ebml.binary_element(
             BLOCK,
             _build_block_data(track_number, relative_timecode_ms, frame),
         ),
         ebml.uint_element(BLOCK_DURATION, duration_ms),
-        ebml.sint_element(DISCARD_PADDING, discard_padding_ns),
     ]
+    if discard_padding_ns > 0:
+        children.append(ebml.sint_element(DISCARD_PADDING, discard_padding_ns))
+    if additions:
+        children.append(_build_block_additions(additions))
     return ebml.master_element(BLOCK_GROUP, children)
 
 
@@ -129,6 +164,16 @@ def _codec_id_for(track: Track) -> str:
         return CODEC_ID_HEVC
     if track.codec_family == "aac":
         return CODEC_ID_AAC
+    if track.codec_family == "ac3":
+        return CODEC_ID_AC3
+    if track.codec_family == "eac3":
+        return CODEC_ID_EAC3
+    if track.codec_family == "mp3":
+        return CODEC_ID_MP3
+    if track.codec_family == "ttml":
+        return CODEC_ID_TTML
+    if track.codec_family == "webvtt":
+        return CODEC_ID_WEBVTT
     raise RemuxError(f"内部错误：未知编码族 {track.codec_family}")
 
 
@@ -145,6 +190,14 @@ def _build_ebml_header() -> bytes:
     return ebml.master_element(EBML_HEADER, children)
 
 
+def _track_type(track: Track) -> int:
+    if track.is_video:
+        return TRACK_TYPE_VIDEO
+    if track.is_subtitle:
+        return TRACK_TYPE_SUBTITLE
+    return TRACK_TYPE_AUDIO
+
+
 def _build_track_entry(
     track: Track, track_number: int, default: bool
 ) -> bytes:
@@ -152,12 +205,9 @@ def _build_track_entry(
         ebml.uint_element(TRACK_NUMBER, track_number),
         # TrackUID 与轨道号取相同的确定性值即可，只需全文件唯一
         ebml.uint_element(TRACK_UID, track_number),
-        ebml.uint_element(
-            TRACK_TYPE,
-            TRACK_TYPE_VIDEO if track.is_video else TRACK_TYPE_AUDIO,
-        ),
+        ebml.uint_element(TRACK_TYPE, _track_type(track)),
         ebml.uint_element(FLAG_DEFAULT, 1 if default else 0),
-        # 不使用 lacing：每块恰好一帧 / 一个音频包
+        # 不使用 lacing：每块恰好一帧 / 一个音频包 / 一条字幕
         ebml.uint_element(FLAG_LACING, 0),
         ebml.string_element(CODEC_ID, _codec_id_for(track)),
     ]
@@ -167,6 +217,10 @@ def _build_track_entry(
 
     if track.codec_private:
         children.append(ebml.binary_element(CODEC_PRIVATE, track.codec_private))
+
+    # 语言码：音频/字幕轨携带 mdhd 中的 ISO 639-2/T 语言码
+    if not track.is_video and track.language and track.language != "und":
+        children.append(ebml.string_element(LANGUAGE, track.language))
 
     if track.is_video:
         children.append(
@@ -178,9 +232,11 @@ def _build_track_entry(
                 ],
             )
         )
-    else:
-        # AAC priming：edit list 的 media_time 表示编码器前导延迟，
-        # 换算为 Matroska 的 CodecDelay（纳秒），解码器据此裁掉前导采样。
+    elif track.is_audio:
+        # 编码器前导延迟（priming）：edit list 的 media_time 表示需在解码
+        # 输出前裁掉的采样数，换算为 Matroska 的 CodecDelay（纳秒）。
+        # 这是所有音频编码共有的机制（AAC/AC-3/E-AC-3/MP3 均可能携带），
+        # 解码器据此跳过前导采样，使 PCM 输出与源严格对齐。
         if track.has_edit and track.edit_media_time > 0:
             codec_delay_ns = (
                 track.edit_media_time * 1_000_000_000
@@ -192,6 +248,7 @@ def _build_track_entry(
             ebml.uint_element(CHANNELS, track.channels),
         ]
         children.append(ebml.master_element(AUDIO, audio_children))
+    # 字幕轨没有 VIDEO/AUDIO 主元素，其余元数据已在上方写齐
 
     return ebml.master_element(TRACK_ENTRY, children)
 
@@ -208,7 +265,7 @@ def _build_info(duration_ms: float) -> bytes:
 
 
 def _place_samples(
-    ordered_tracks: Sequence[Track], track_numbers: Sequence[int]
+    mp4: Mp4File, ordered_tracks: Sequence[Track], track_numbers: Sequence[int]
 ) -> List[_PlacedSample]:
     """把所有 track 的样本按 DTS 合并为全局解码顺序。
 
@@ -238,6 +295,23 @@ def _place_samples(
                 discard_ns = _round_div(
                     padding_units * 1_000_000_000, track.timescale
                 )
+
+            # WebVTT：在放置阶段把 vttc 盒转换为 cue 正文与附加数据。
+            # 其它编码的样本字节仍留到簇构建时按偏移零拷贝切片。
+            additions = []
+            frame_override = None
+            if track.codec_family == "webvtt":
+                raw_sample = mp4.data[
+                    sample.offset:sample.offset + sample.size
+                ]
+                cue = convert_sample(raw_sample)
+                frame_override = cue.payload
+                if cue.has_additions:
+                    if cue.identifier:
+                        additions.append((BLOCK_ADD_ID_IDENTIFIER, cue.identifier))
+                    if cue.settings:
+                        additions.append((BLOCK_ADD_ID_SETTINGS, cue.settings))
+
             track_items.append(
                 _PlacedSample(
                     track_number=number,
@@ -250,7 +324,10 @@ def _place_samples(
                     # DTS 可能为负（B 帧重排 / priming），仅用于排序
                     dts_time=Fraction(sample.dts - edit, track.timescale),
                     is_video=track.is_video,
+                    is_subtitle=track.is_subtitle,
                     discard_padding_ns=discard_ns,
+                    block_additions=additions,
+                    frame_override=frame_override,
                 )
             )
 
@@ -266,8 +343,14 @@ def _place_samples(
     if not raw:
         raise RemuxError("没有任何可写入的样本")
 
-    # 归一化 DTS 升序；同一时刻视频优先，再按轨道号，保证交织结果确定
-    raw.sort(key=lambda p: (p.dts_time, 0 if p.is_video else 1, p.track_number))
+    # 归一化 DTS 升序；同一时刻视频 → 音频 → 字幕，再按轨道号，保证交织确定
+    raw.sort(
+        key=lambda p: (
+            p.dts_time,
+            0 if p.is_video else (1 if not p.is_subtitle else 2),
+            p.track_number,
+        )
+    )
     return raw
 
 
@@ -302,9 +385,13 @@ def _build_clusters(
         cluster_size = 0
 
     for item in placed:
-        frame = mp4.data[item.sample.offset:item.sample.offset + item.sample.size]
-        if len(frame) != item.sample.size:  # 防御性校验，正常不会触发
-            raise RemuxError("读取样本数据时到达文件末尾，源文件可能被截断")
+        if item.frame_override is not None:
+            # wvtt 已在放置阶段转换为 cue 正文，长度与原样本不同属正常
+            frame = item.frame_override
+        else:
+            frame = mp4.data[item.sample.offset:item.sample.offset + item.sample.size]
+            if len(frame) != item.sample.size:  # 防御性校验，正常不会触发
+                raise RemuxError("读取样本数据时到达文件末尾，源文件可能被截断")
 
         need_new_cluster = False
         if not blocks:
@@ -340,6 +427,17 @@ def _build_clusters(
                 item.duration_ms,
                 item.discard_padding_ns,
             )
+        elif item.is_subtitle:
+            # 字幕块统一用 BlockGroup：BlockDuration 表达 cue 呈现时长，
+            # WebVTT 的 cue id/settings 通过 BlockAdditions 保留
+            block = _build_block_group(
+                item.track_number,
+                relative_tc,
+                frame,
+                item.duration_ms,
+                0,
+                item.block_additions,
+            )
         else:
             block = _build_simple_block(
                 item.track_number,
@@ -359,24 +457,30 @@ def write_mkv(mp4: Mp4File) -> bytes:
     if not mp4.tracks:
         raise RemuxError("MP4 中没有可写入的 track")
 
-    # 轨道排列：视频在前、音频在后；同类保持源顺序。轨道号从 1 开始。
+    # 轨道排列：视频 → 音频 → 字幕；同类保持源顺序。轨道号从 1 开始。
+    def _track_order(track: Track) -> int:
+        if track.is_video:
+            return 0
+        if track.is_audio:
+            return 1
+        return 2
+
     ordered_tracks = sorted(
-        mp4.tracks, key=lambda t: (0 if t.is_video else 1, t.track_id)
+        mp4.tracks, key=lambda t: (_track_order(t), t.track_id)
     )
     track_numbers = list(range(1, len(ordered_tracks) + 1))
-    # 第一条视频与第一条音频为默认轨道
+    # 每类轨道的第一条为该类的默认轨道
     default_flags: List[bool] = []
-    seen_video = seen_audio = False
+    seen = {"video": False, "audio": False, "subtitle": False}
     for track in ordered_tracks:
-        if track.is_video:
-            default_flags.append(not seen_video)
-            seen_video = True
-        else:
-            default_flags.append(not seen_audio)
-            seen_audio = True
+        kind = "video" if track.is_video else (
+            "audio" if track.is_audio else "subtitle"
+        )
+        default_flags.append(not seen[kind])
+        seen[kind] = True
 
     header = _build_ebml_header()
-    placed = _place_samples(ordered_tracks, track_numbers)
+    placed = _place_samples(mp4, ordered_tracks, track_numbers)
     # 总时长 = 最后一个样本的显示结束时间（PTS + 自身时长）
     duration_ms = float(
         max(item.pts_ms + item.duration_ms for item in placed)

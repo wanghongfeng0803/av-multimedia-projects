@@ -4,13 +4,19 @@
 在文件中的字节偏移、长度、解码时间戳(DTS)、显示时间戳(PTS)以及关键帧
 标记全部还原出来，并提取编码私有数据（avcC / hvcC / esds）。
 
-支持基础版本需要的常见盒类型与容错点：
+支持常见盒类型与容错点：
 - 32 位 largesize（64 位 size）盒；
 - version 0/1 的 mdhd、version 0/1 的 ctts（有符号合成偏移）；
 - stco（32 位块偏移）与 co64（64 位块偏移）；
 - 标准 28 字节音频、78 字节视频 sample entry，并对子盒做扫描式容错；
 - 单段 edit list（edts/elst）的时间轴偏移；
 - 明确拒绝碎片化 MP4（moof）、加密（sinf/encv/enca）等不支持的结构。
+
+覆盖的编码：
+- 视频：H.264/AVC（avc1/avc3）、HEVC（hvc1/hev1）；
+- 音频：AAC（mp4a + esds/ASC）、MP3（mp4a 无 ASC 或 objectType=0x6B）、
+  AC-3（ac-3）、E-AC-3（ec-3）；
+- 字幕：TTML（stpp，样本即完整 TTML 文档）、WebVTT（wvtt，vttc 盒）。
 """
 
 from __future__ import annotations
@@ -29,7 +35,13 @@ _VIDEO_CODECS = {
     "hev1": "hevc",
 }
 _AUDIO_CODECS = {
-    "mp4a": "aac",
+    "mp4a": "aac",   # 实际编码需结合 esds 判定：有 esds 为 AAC，否则为 MP3
+    "ac-3": "ac3",
+    "ec-3": "eac3",
+}
+_SUBTITLE_CODECS = {
+    "stpp": "ttml",    # 样本即完整 TTML 文档，可直拷进 MKV
+    "wvtt": "webvtt",  # 样本为 vttc/vtte 盒，写出时转换为 Matroska WebVTT
 }
 
 
@@ -63,7 +75,8 @@ class Track:
     height: int = 0
     channels: int = 0
     sample_rate: int = 0
-    codec_private: bytes = b""   # avcC / hvcC / AudioSpecificConfig 原始字节
+    language: str = "und"        # ISO 639-2/T 语言码（mdhd），未指定为 und
+    codec_private: bytes = b""   # avcC / hvcC / AudioSpecificConfig / vttC 原始字节
     samples: List[Sample] = field(default_factory=list)
 
     @property
@@ -73,6 +86,10 @@ class Track:
     @property
     def is_audio(self) -> bool:
         return self.handler == "soun"
+
+    @property
+    def is_subtitle(self) -> bool:
+        return self.handler == "subt"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +198,30 @@ def _parse_mdhd(mdhd: Box) -> Tuple[int, int]:
     return timescale, duration
 
 
+def _parse_mdhd_language(mdhd: Box) -> str:
+    """读取 mdhd 的 ISO 639-2/T 语言码；未指定（und/0x55C4）或非法时返回 'und'。
+
+    语言字段为 3 个 5 位字符，各加上 0x60 得到小写 ASCII（如 0x55C4 → 'und'）。
+    注意 mdhd.data 仍包含 4 字节 fullbox 头：
+    - v0：creation(4)+modification(4)+timescale(4)+duration(4)=16，语言在 data[20]；
+    - v1：creation(8)+modification(8)+timescale(4)+duration(8)=28，语言在 data[32]。
+    """
+    version, _ = _parse_full_box_header(mdhd.data)
+    offset = 32 if version == 1 else 20
+    if len(mdhd.data) < offset + 2:
+        return "und"
+    packed = unpack(">H", mdhd.data[offset:offset + 2])[0]
+    chars = (
+        0x60 + ((packed >> 10) & 0x1F),
+        0x60 + ((packed >> 5) & 0x1F),
+        0x60 + (packed & 0x1F),
+    )
+    if any(not (0x61 <= c <= 0x7A) for c in chars):
+        return "und"
+    code = bytes(chars).decode("ascii")
+    return "und" if code == "und" else code
+
+
 def _parse_hdlr(hdlr: Box) -> str:
     if len(hdlr.data) < 12:
         raise RemuxError("[hdlr] 长度不足")
@@ -199,15 +240,21 @@ def _scan_subbox(entry: Box, wanted: Tuple[str, ...]) -> Optional[Box]:
     子盒从负载偏移 78 / 28 开始。先按标准布局解析，失败再退化为对整个
     负载的四字符码特征扫描（要求盒长度自洽才采信），以容忍非标准封装。
     """
-    is_video = wanted[0] in ("avcC", "hvcC")
-    # 标准负载固定头：视觉 entry 78 字节，音频 entry(v0) 28 字节
-    standard_offset = 78 if is_video else 28
+    # 视觉条目（avcC/hvcC）与字幕条目（vttC）同为 78 字节宽固定头；
+    # 音频条目（esds/dac3/dec3）为 28 字节固定头
+    wide_header = wanted[0] in ("avcC", "hvcC", "vttC")
+    standard_offset = 78 if wide_header else 28
     for offset in (standard_offset, 0):
         if offset >= len(entry.data):
             continue
-        for sub in parse_boxes(entry.data[offset:], base_offset=offset):
-            if sub.kind in wanted:
-                return sub
+        try:
+            for sub in parse_boxes(entry.data[offset:], base_offset=offset):
+                if sub.kind in wanted:
+                    return sub
+        except RemuxError:
+            # 该偏移不是合法盒序列（如把字幕条目的视觉式固定头当盒解析），
+            # 继续尝试下一偏移，最终退化为四字符码特征扫描
+            continue
     # 兜底：在整个负载中搜索四字符码，并要求其前 4 字节声明的长度自洽
     marker = wanted[0].encode("latin-1")
     idx = entry.data.find(marker)
@@ -279,8 +326,13 @@ def _read_descriptor(data: bytes, pos: int) -> Tuple[int, bytes, int]:
     return tag, data[pos:pos + size], pos + size
 
 
-def _parse_esds(esds: Box) -> bytes:
-    """从 esds 盒中提取 AudioSpecificConfig（DecoderSpecificInfo, tag=5）。"""
+def _parse_esds(esds: Box) -> Tuple[int, bytes]:
+    """解析 esds 盒，返回 (objectTypeIndication, DecoderSpecificInfo 字节)。
+
+    objectTypeIndication 用于区分同为 mp4a 封装的不同编码：
+    0x40 为 AAC（ISO/IEC 14496-3），0x6B 为 MPEG-1 Layer III（MP3）。
+    MP3 通常没有 DecoderSpecificInfo，此时第二项返回空字节串。
+    """
     _parse_full_box_header(esds.data)
     # ES_Descr tag=0x03
     tag, es_payload, _ = _read_descriptor(esds.data, 4)
@@ -292,15 +344,21 @@ def _parse_esds(esds: Box) -> bytes:
     tag, dec_payload, _ = _read_descriptor(es_payload, 3)
     if tag != 0x04:
         raise RemuxError(f"[esds] 缺少 DecoderConfigDescriptor，实际 tag=0x{tag:02X}")
-    # DecoderConfigDescr 固定 13 字节头部后接 DecoderSpecificInfo(0x05)
-    if 13 >= len(dec_payload):
+    if len(dec_payload) < 13:
         raise RemuxError("[esds] DecoderConfigDescriptor 内容过短")
+    object_type = dec_payload[0]
+    # 固定 13 字节头部之后是可选的 DecoderSpecificInfo(0x05)
+    if len(dec_payload) == 13:
+        return object_type, b""
     tag, asc, _ = _read_descriptor(dec_payload, 13)
     if tag != 0x05:
         raise RemuxError(f"[esds] 缺少 DecoderSpecificInfo，实际 tag=0x{tag:02X}")
+    if not asc:
+        # MP3 允许无 ASC；AAC 必须有至少 2 字节的配置
+        return object_type, b""
     if len(asc) < 2:
         raise RemuxError("[esds] AudioSpecificConfig 至少需要 2 字节")
-    return bytes(asc)
+    return object_type, bytes(asc)
 
 
 def _parse_audio_specific_config(asc: bytes) -> Tuple[int, int]:
@@ -591,6 +649,7 @@ def _parse_trak(trak: Box, file_size: int) -> Track:
     stsd = _require_child(stbl, "stsd")
 
     timescale, duration = _parse_mdhd(mdhd)
+    language = _parse_mdhd_language(mdhd)
     handler = _parse_hdlr(hdlr)
     entry = _parse_stsd(stsd)
     tag = entry.kind
@@ -599,17 +658,20 @@ def _parse_trak(trak: Box, file_size: int) -> Track:
 
     if handler == "vide" or tag in _VIDEO_CODECS:
         if tag not in _VIDEO_CODECS:
-            raise RemuxError(f"不支持的视频编码格式: {tag}（基础版本支持 avc1/avc3/hvc1/hev1）")
+            raise RemuxError(f"不支持的视频编码格式: {tag}（支持 avc1/avc3/hvc1/hev1）")
         track = _build_video_track(entry, stbl, timescale, duration, tag, file_size)
     elif handler == "soun" or tag in _AUDIO_CODECS:
-        if tag not in _AUDIO_CODECS:
-            raise RemuxError(f"不支持的音频编码格式: {tag}（基础版本支持 mp4a/AAC）")
         track = _build_audio_track(entry, stbl, timescale, duration, tag, file_size)
+    elif handler == "subt" or tag in _SUBTITLE_CODECS:
+        if tag not in _SUBTITLE_CODECS:
+            raise RemuxError(f"不支持的字幕格式: {tag}（支持 stpp/TTML、wvtt/WebVTT）")
+        track = _build_subtitle_track(entry, stbl, timescale, duration, tag, file_size)
     else:
         raise RemuxError(f"不支持的 track 类型: handler={handler} codec={tag}")
 
     track.has_edit = has_edit
     track.edit_media_time = edit_media_time
+    track.language = language
     return track
 
 
@@ -638,14 +700,42 @@ def _build_video_track(entry, stbl, timescale, duration, tag, file_size) -> Trac
 
 
 def _build_audio_track(entry, stbl, timescale, duration, tag, file_size) -> Track:
-    esds = _scan_subbox(entry, ("esds",))
-    if esds is None:
-        raise RemuxError(f"[{tag}] 中找不到 esds 描述盒（基础版本仅支持 AAC）")
-    asc = _parse_esds(esds)
-    asc_rate, asc_channels = _parse_audio_specific_config(asc)
-    fixed_channels, fixed_rate = _parse_audio_fixed_fields(entry)
-    channels = asc_channels or fixed_channels
-    sample_rate = asc_rate or fixed_rate
+    """构建音频轨。
+
+    - mp4a + esds：AAC，私有数据为 AudioSpecificConfig；
+    - mp4a 无 esds：MP3（裸 MPEG 音频帧，MKV 用 A_MPEG/L3，无私有数据）；
+    - ac-3 / ec-3：Dolby AC-3 / E-AC-3，真实配置在 dac3/dec3 盒中，
+      MKV 不需要 CodecPrivate，采样率/声道取自 sample entry 固定头。
+    """
+    if tag == "mp4a":
+        esds = _scan_subbox(entry, ("esds",))
+        if esds is not None:
+            object_type, asc = _parse_esds(esds)
+            if object_type == 0x6B or not asc:
+                # MPEG-1 Audio（MP3）：esds 中无 AudioSpecificConfig，
+                # objectTypeIndication=0x6B；裸帧直接拷贝，MKV 无私有数据
+                channels, sample_rate = _parse_audio_fixed_fields(entry)
+                family, private = "mp3", b""
+            elif object_type == 0x40:
+                asc_rate, asc_channels = _parse_audio_specific_config(asc)
+                fixed_channels, fixed_rate = _parse_audio_fixed_fields(entry)
+                channels = asc_channels or fixed_channels
+                sample_rate = asc_rate or fixed_rate
+                family, private = "aac", asc
+            else:
+                raise RemuxError(
+                    f"[mp4a] 不支持的音频 objectTypeIndication=0x{object_type:02X}"
+                    f"（仅支持 AAC 0x40 / MP3 0x6B）"
+                )
+        else:
+            # 无 esds 的 mp4a：同样按 MP3 处理（MOV/MP4 中 .mp3 的另一种封装）
+            channels, sample_rate = _parse_audio_fixed_fields(entry)
+            family, private = "mp3", b""
+    else:
+        family = _AUDIO_CODECS[tag]  # ac3 / eac3
+        channels, sample_rate = _parse_audio_fixed_fields(entry)
+        private = b""
+
     if channels <= 0 or sample_rate <= 0:
         raise RemuxError(
             f"[{tag}] 无法确定音频参数: channels={channels} rate={sample_rate}"
@@ -654,13 +744,40 @@ def _build_audio_track(entry, stbl, timescale, duration, tag, file_size) -> Trac
     track = Track(
         track_id=0,
         handler="soun",
-        codec_family="aac",
+        codec_family=family,
         codec_tag=tag,
         timescale=timescale,
         duration=duration,
         channels=channels,
         sample_rate=sample_rate,
-        codec_private=asc,
+        codec_private=private,
+    )
+    _fill_samples(track, stbl, file_size, is_video=False)
+    return track
+
+
+def _build_subtitle_track(entry, stbl, timescale, duration, tag, file_size) -> Track:
+    """构建字幕轨。
+
+    - stpp（TTML）：每个样本即一份完整 TTML 文档，可逐字节直拷进 MKV；
+    - wvtt（WebVTT）：样本是 vttc/vtte 盒序列，转换在 MKV 写入器完成，
+      条目内可选的 vttC 全局配置盒作为 CodecPrivate 原样保留。
+    """
+    family = _SUBTITLE_CODECS[tag]
+    codec_private = b""
+    if family == "webvtt":
+        vttc = _scan_subbox(entry, ("vttC",))
+        if vttc is not None:
+            codec_private = bytes(vttc.data)
+
+    track = Track(
+        track_id=0,
+        handler="subt",
+        codec_family=family,
+        codec_tag=tag,
+        timescale=timescale,
+        duration=duration,
+        codec_private=codec_private,
     )
     _fill_samples(track, stbl, file_size, is_video=False)
     return track
