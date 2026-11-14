@@ -107,7 +107,8 @@ class TestOverlayRenderer:
         r._get_tile("a")
         r._get_tile("b")
         r._get_tile("c")  # 超出容量，"a" 被淘汰
-        assert "a" not in r._cache and "c" in r._cache
+        assert r._cache_key("a") not in r._cache
+        assert r._cache_key("c") in r._cache
 
     def test_render_frame_modifies_pixels(self):
         frame = bytearray([30] * 640 * 360 * 3)

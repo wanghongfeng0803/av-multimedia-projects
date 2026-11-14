@@ -29,9 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .fonts import Font, load_font
+from .fonts import Font, load_font, resolve_font
 from .render import OverlayRenderer, Style
 from .srt import Cue
+from .style import SubtitleStyle
 from .timeline import FrameTimeline, SubtitleScheduler
 
 __all__ = ["BurnResult", "probe_video", "burn_subtitles"]
@@ -156,7 +157,7 @@ def burn_subtitles(
     cues: list[Cue],
     *,
     font: Font | None = None,
-    style: Style | None = None,
+    style: Style | SubtitleStyle | None = None,
     crf: int = 23,
     preset: str = "medium",
     overwrite: bool = False,
@@ -165,7 +166,11 @@ def burn_subtitles(
     """把字幕烧录进视频，返回执行结果摘要。
 
     :param cues: 已解析的字幕（毫秒时间戳）
-    :param font: 自定义字体；默认 :func:`subburn.fonts.load_font` 自动选择
+    :param font: 自定义字体；默认按样式自动选择——新版
+        :class:`~subburn.style.SubtitleStyle` 走字体族回退链
+        （:func:`subburn.fonts.resolve_font`），旧版 :class:`Style` 沿用
+        :func:`subburn.fonts.load_font` 的系统探测；显式传入时优先级最高
+    :param style: 旧版 :class:`Style` 或新版 :class:`SubtitleStyle`
     :param crf/preset: x264 质量与速度档
     :param overwrite: 输出已存在时是否覆盖
     """
@@ -176,9 +181,13 @@ def burn_subtitles(
 
     timeline = probe_video(input_path)
     w, h, fps = timeline.width, timeline.height, timeline.fps
-    frame_bytes = w * h * 3
-    renderer = OverlayRenderer(font or load_font(size=max(20, h // 24)),
-                               style or Style())
+    if font is None:
+        if isinstance(style, SubtitleStyle):
+            # 新版样式：字体族/字号/字重 -> 回退链解析（缺失自动降级）
+            font = resolve_font(style.font, frame_height=h)
+        else:
+            font = load_font(size=max(20, h // 24))
+    renderer = OverlayRenderer(font, style or Style())
     scheduler = SubtitleScheduler(cues, fps=fps)
 
     with tempfile.TemporaryDirectory(prefix="subburn_") as tmpdir:

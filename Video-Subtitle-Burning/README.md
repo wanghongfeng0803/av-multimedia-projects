@@ -59,13 +59,43 @@ RGB24 帧缓冲 ──► ffmpeg 编码（pipeline.py 负责解码/编码双进�
   字母/数字/标点，未收录字符渲染空心方框）与可选 **Pillow TTF**（自动探测
   微软雅黑/黑体/PingFang/Noto 等，支持中文与任意字号）；
 - 光栅化统一输出 **RGBA**，以 alpha 而非颜色标记墨迹，因此纯黑文字也能正确渲染；
-- 瓦片支持描边（8 邻域逐层外扩）、半透明阴影、半透明底盒、多行居中排版，
+- 瓦片支持描边（8 邻域逐层外扩）、半透明阴影、半透明底盒、多行排版，
   按文本缓存，同一字幕在其生命周期内只光栅化一次；
 - 叠加用自写的源覆盖公式逐像素混合，含 alpha=0/255 快路径与越界裁剪：
 
   ```
   dst = src_rgb·src_a + dst_rgb·(1 − src_a)
   ```
+
+### 3.5 字幕样式系统（`subburn/style.py`）
+
+在渲染层之上新增一套可配置样式，数据描述与渲染逻辑分离，全部为冻结
+dataclass / Enum，可哈希（直接作为瓦片缓存键的一部分）、可 JSON 往返。
+
+**数据结构（样式参数 → 渲染映射）：**
+
+| 子系统 | 类型 | 可配置项 | 渲染映射 |
+| --- | --- | --- | --- |
+| 字体 | `FontSpec` / `FontWeight` | 字体族回退链、字号（0=自动）、九档字重 | `FontRegistry` 解析族→字重→字体文件，选不到原生字重时合成粗体 |
+| 颜色 | `Color` | 8-bit RGBA，透明度独立通道 | alpha 直接进入瓦片墨迹/底盒/阴影像素，复用源覆盖混合 |
+| 位置 | `Position` / `Alignment` / `Margins` | 水平三档、垂直三档对齐 + 四边边距 | `anchor_origin` 计算锚点坐标，夹紧到画面内 |
+
+颜色支持 `#rgb(a)` / `#rrggbbaa`、`rgb()/rgba()/hsl()/hsla()`、命名色、
+整数、元组多种输入，并提供 **RGB↔HSL、RGB↔HSV** 的颜色空间转换（可往返）。
+
+**边界情况处理：**
+
+- **字体缺失回退**：族链逐个匹配 → 系统默认字体 → 内置位图字体，三级降级
+  永不失败；损坏字体文件被跳过；无原生 bold 时位图/Pillow 均以合成粗体描厚；
+- **颜色空间与越界**：HSL/HSV 色相自动取模、浮点通道按 0~1 解释；
+  外部配置可用 `parse(clamp=True)` 把越界通道夹紧而非抛异常；
+- **位置越界**：单边超画面先夹紧；对边边距之和占满画面时双双归零（避免负
+  可用宽度把字幕推出画面）；字幕块比画面还大时退化为贴边，超出部分由混合
+  层裁剪，保证至少左上角内容可见。
+
+**兼容性**：旧版 `Style`（RGB 三元组 + 单一 `margin`）完整保留，
+`SubtitleStyle.from_legacy()` 逐项翻译；默认样式的渲染结果与旧版**逐像素
+等价**（有回归测试锁定零差异）。
 
 ### 4. ffmpeg 管道（`subburn/pipeline.py`）
 
@@ -95,23 +125,54 @@ python -m subburn burn input.mp4 subs.srt --strict --json -y
 作为库使用：
 
 ```python
-from subburn import parse_srt_file, burn_subtitles, load_font, Style
+from subburn import (
+    parse_srt_file, burn_subtitles, SubtitleStyle, FontSpec,
+    FontWeight, Color, Position, HAlign, VAlign, Margins,
+)
 
 cues, warnings = parse_srt_file("subs.srt")          # 状态机解析
-result = burn_subtitles(
-    "input.mp4", "out.mp4", cues,
-    font=load_font(size=32),                          # 不传 font 也会自动选字体
-    style=Style(box=True, outline_width=2),
-    progress_callback=lambda r: print(f"{r*100:.0f}%"),
+
+# 新版样式：字体族回退链 + 字重、RGBA 颜色（含透明度）、对齐与四边边距
+style = SubtitleStyle(
+    font=FontSpec(families=("Arial", "微软雅黑"), size=32,
+                  weight=FontWeight.BOLD),
+    color=Color.parse("#ffdd55cc"),                   # 支持 hsl()/命名色等
+    outline_color=Color(0, 0, 80),
+    position=Position(HAlign.RIGHT, VAlign.TOP,
+                      Margins(left=12, top=20, right=24, bottom=12)),
+    box=True, box_color=Color.parse("hsla(220,80%,20%,0.45)"),
 )
+result = burn_subtitles("input.mp4", "out.mp4", cues, style=style,
+                        progress_callback=lambda r: print(f"{r*100:.0f}%"))
 print(result.frames_written, result.had_audio)
+```
+
+样式也可用 JSON 描述（字段与 `SubtitleStyle.to_dict()` 一致），命令行经
+`--style style.json` 载入，并用单项参数覆盖：
+
+```bash
+python -m subburn burn input.mp4 subs.srt \
+    --style style.json --alpha 200 --halign left --margin 24 -y
+
+# 不写 JSON 也能直接调：字体族（可重复构成回退链）、字重、颜色、对齐、边距
+python -m subburn burn input.mp4 subs.srt \
+    --font-family Arial --font-family 微软雅黑 --font-weight 700 \
+    --color "hsl(240,100%,50%)" --valign top
+```
+
+旧版 `Style` 接口继续可用，行为不变：
+
+```python
+from subburn import burn_subtitles, load_font, Style
+burn_subtitles("in.mp4", "out.mp4", cues,
+               font=load_font(size=32), style=Style(box=True))
 ```
 
 ## 测试
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest          # 74 个用例：解析/时间码/调度边界/混合数学/ffmpeg 端到端
+python -m pytest          # 175 个用例：解析/样式系统/字体回退/混合数学/ffmpeg 端到端
 python -m doctest subburn/srt.py
 ```
 
@@ -123,10 +184,11 @@ python -m doctest subburn/srt.py
 subburn/
   srt.py        编码探测、换行归一化、时间码换算、四态状态机
   timeline.py   帧时间轴与半开区间字幕调度
-  fonts.py      内置 5x7 位图字体 + 可选 Pillow TTF
+  style.py      样式数据结构：Color/FontSpec/FontWeight/Position/Margins
+  fonts.py      位图字体 + Pillow TTF + 字体族注册表与回退链
   render.py     排版、瓦片缓存、RGBA 源覆盖混合
   pipeline.py   ffprobe 探测、解码/编码双进程、音频直通
-  cli.py        命令行入口
+  cli.py        命令行入口（样式 JSON + 单项参数）
 tests/          单元测试 + ffmpeg 端到端集成测试
 demo/           示例视频与 SRT
 ```
@@ -135,5 +197,7 @@ demo/           示例视频与 SRT
 
 - 位图字体路径（无 Pillow 时）不含 CJK 字形，中文显示为空心方框；
   安装 Pillow 并存在系统 TTF 即自动获得完整字符集；
+- 字重为九档语义映射：缺少原生 bold 文件时用合成粗体描厚，不支持
+  可变字体的连续字重插值；
 - SRT 富文本标签（`<b>`、`{\\an8}` 等）按普通文本处理，不做样式解析；
 - 输出编码固定为 H.264/yuv420p（容器可选 MP4/MKV）。
