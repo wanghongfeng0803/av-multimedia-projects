@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 打包产物 / 临时素材
+*.ts
+*.m3u8
+segments.json
+tmp_smoke/
+demo/out/
