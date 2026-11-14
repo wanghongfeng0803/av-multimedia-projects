@@ -3,6 +3,7 @@
 对外主要入口：
 - :func:`transcode_tool.probe.probe_media`：探测输入媒体信息
 - :func:`transcode_tool.transcoder.transcode`：执行转码（H.264/H.265/VP9/AV1/VP8）
+- :func:`transcode_tool.batch.batch_transcode`：文件夹批量转码（有界并发+聚合进度）
 - :func:`transcode_tool.codecs.resolve_codec` / :func:`list_codecs`：编码注册表
 - :func:`transcode_tool.containers.resolve_container`：容器注册表
 """
@@ -19,6 +20,29 @@ from .errors import (
 from .models import MediaInfo, StreamInfo, TranscodeResult
 from .probe import probe_media
 from .transcoder import transcode
+from .batch import (
+    BatchJob,
+    BatchReport,
+    BatchSnapshot,
+    JobOutcome,
+    BatchErrorLogger,
+    BatchProgress,
+    batch_transcode,
+    scan_video_files,
+    plan_jobs,
+    DEFAULT_VIDEO_EXTENSIONS,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    STATUS_DONE,
+    STATUS_FAILED,
+    STATUS_SKIPPED,
+    STATUS_CANCELLED,
+    FAIL_CONTINUE,
+    FAIL_STOP,
+    EXIST_SKIP,
+    EXIST_OVERWRITE,
+    EXIST_SUFFIX,
+)
 from .codecs import (
     CodecSpec,
     EncoderSpec,
@@ -46,6 +70,28 @@ __all__ = [
     # 核心 API
     "probe_media",
     "transcode",
+    "batch_transcode",
+    # 批量模块
+    "scan_video_files",
+    "plan_jobs",
+    "BatchJob",
+    "BatchReport",
+    "BatchSnapshot",
+    "JobOutcome",
+    "BatchErrorLogger",
+    "BatchProgress",
+    "DEFAULT_VIDEO_EXTENSIONS",
+    "STATUS_QUEUED",
+    "STATUS_RUNNING",
+    "STATUS_DONE",
+    "STATUS_FAILED",
+    "STATUS_SKIPPED",
+    "STATUS_CANCELLED",
+    "FAIL_CONTINUE",
+    "FAIL_STOP",
+    "EXIST_SKIP",
+    "EXIST_OVERWRITE",
+    "EXIST_SUFFIX",
     # 数据模型
     "MediaInfo",
     "StreamInfo",

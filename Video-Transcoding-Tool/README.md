@@ -55,6 +55,59 @@ python transcode.py --list-codecs
 
 也可以用模块方式调用：`python -m transcode_tool input.mp4 -o out.mp4 --codec av1`。
 
+## 文件夹批量转码
+
+`batch` 子命令对一个或多个目录/文件执行批量转码，实时显示**聚合进度**，
+单文件失败只记入错误日志而不拖垮整批。批量层在单文件 `transcode()` 之上
+纯编排实现（手写目录扫描、有界任务队列与进度聚合，零第三方依赖），
+单文件转码的全部能力与参数原样透传：
+
+```bash
+# 扫描目录一层，逐个转码到 out/，镜像子目录结构，stderr 实时显示总进度
+python -m transcode_tool batch ./videos -o ./out --preset medium
+
+# 递归扫描、2 个 ffmpeg 并发、输出已存在时自动加序号
+python -m transcode_tool batch ./videos -o ./out -r -j 2 --on-exist suffix
+
+# 多输入混合（文件+目录），失败立即停止派发，H.265 + 自定义码率/分辨率
+python -m transcode_tool batch dir_a dir_b clip.mp4 -o ./out -r \
+    --codec h265 --bitrate 2M --resolution 720p --on-fail stop
+
+# 只处理指定扩展名；机器可读 JSON 汇总；关闭动态进度行
+python -m transcode_tool batch ./videos --extensions .mp4,.mkv --json --no-progress
+```
+
+作为库调用，进度通过不可变快照回调上报，结果为结构化 `BatchReport`：
+
+```python
+from transcode_tool import batch_transcode
+
+def on_progress(snapshot):
+    print(f"{snapshot.overall_ratio:.1%} 成功{snapshot.done} "
+          f"失败{snapshot.failed} 跳过{snapshot.skipped} "
+          f"转码中: {snapshot.current_files}")
+
+report = batch_transcode(
+    ["./videos"], output_dir="./out", recursive=True, jobs=2,
+    codec="h265", preset="medium", on_fail="continue",
+    on_exist="skip", progress_callback=on_progress,
+)
+print(report.to_dict())   # total/done/failed/skipped + 每个文件的终态与错误
+```
+
+批量行为要点：
+
+| 主题 | 策略 |
+| --- | --- |
+| 扫描 | 手写 `os.scandir` 迭代，只缓存路径字符串；按视频扩展名初筛，真伪仍由 ffprobe 按内容裁决；支持递归、自定义扩展名、多输入去重 |
+| 输出命名 | `output_dir` 内按输入根**镜像目录结构**，命名 `<名>_<编码>.<容器扩展名>`；同批撞名自动加 `_2/_3` 序号 |
+| 输出已存在 | `skip`（默认，跳过并记日志）/ `overwrite`（覆盖）/ `suffix`（自动改名） |
+| 单文件失败 | `continue`（默认，失败入日志后继续）/ `stop`（不再派发新任务，未执行者记为 cancelled） |
+| 并发 | `-j` 有界并发，默认 1（顺序执行，内存峰值最低）；队列基于 `threading.Condition` 手写，线程安全聚合进度 |
+| 错误日志 | 结构化文本（时间戳/级别/输入/输出/异常类型/消息/ffmpeg 日志路径），默认 `<输出目录>/_batch_errors.log`，行缓冲可实时 tail |
+| 自包含防护 | 输出目录位于输入目录内且递归时，扫描自动排除输出目录，产物不会被当成新输入反复转码 |
+| 中断 | Ctrl+C 协作式停止派发，在跑的 ffmpeg 自然结束（避免半成品），未执行任务记 cancelled，退出码 8 |
+
 作为库使用：
 
 ```python
@@ -188,6 +241,24 @@ input                 输入视频（按内容探测，扩展名不限）
 --list-codecs         列出本机 ffmpeg 的编码/编码器/容器支持情况后退出
 ```
 
+`batch` 子命令参数（单文件转码相关参数同名同义、透传给每个任务）：
+
+```
+inputs                一个或多个输入文件/目录（目录按视频扩展名筛选）
+-o, --output-dir DIR  统一输出目录，按输入根镜像子目录；省略时产物在各输入旁
+-r, --recursive       递归扫描子目录（输出目录在输入目录内时自动排除）
+-j, --jobs N          并发 ffmpeg 数（默认 1，建议不超过物理核数）
+--on-fail MODE        continue(默认) 单文件失败继续 / stop 失败后停止派发
+--on-exist MODE       skip(默认) / overwrite / suffix(自动加序号)
+--extensions LIST     自定义扫描扩展名，逗号分隔，如 .mp4,.mkv
+--log PATH            错误日志路径（默认 <输出目录>/_batch_errors.log）
+--no-progress         关闭 stderr 实时聚合进度
+--codec/--container/--crf/--preset/--bitrate/--rate-mode/--resolution/
+--allow-upscale/--audio-bitrate/--segment-duration/--segment-count
+                      与单文件命令同义，应用于批内每个任务
+--json                JSON 格式输出批量汇总
+```
+
 ## 退出码
 
 | 码 | 含义 |
@@ -200,6 +271,7 @@ input                 输入视频（按内容探测，扩展名不限）
 | 5 | 输出文件已存在且未允许覆盖 |
 | 6 | ffmpeg 执行失败 |
 | 7 | 本机 ffmpeg 不支持目标编码所需的任何编码器 |
+| 8 | 批量转码被用户中断（`batch` 子命令；批量中存在失败文件时退出码为 6） |
 
 ## 项目结构
 
@@ -219,7 +291,8 @@ transcode_tool/
 ├── runner.py         # Popen 流式进度解析、stderr 落盘的低内存 ffmpeg 运行器
 ├── segments.py       # 分段规划、concat 无损拼接、临时目录管理
 ├── transcoder.py     # 核心编排：探测→规划→编码(可分段)→拼接→复核
-└── cli.py            # argparse 命令行
+├── batch.py          # 批量编排：目录扫描、任务规划、手写有界队列、聚合进度、错误日志
+└── cli.py            # argparse 命令行（单文件 + batch 子命令）
 tests/                # pytest 单元与端到端测试（自动生成各类不规范/分段样本）
 transcode.py          # 便捷脚本入口
 ```
