@@ -39,8 +39,13 @@ class EbmlElement:
         return self.payload.decode("utf-8")
 
 
-def read_vint(buf: bytes, pos: int) -> tuple[int, int]:
-    """读取 size VINT，返回 (去掉长度标记后的数值, next_pos)。"""
+def read_vint(buf: bytes, pos: int) -> tuple[Optional[int], int]:
+    """读取 size VINT，返回 (去掉长度标记后的数值, next_pos)。
+
+    未知大小（unknown-size）VINT（数据位全 1，如流式 MKV 的 Segment 头
+    8 字节 ``0xFF..FF``）返回 ``(None, next_pos)``，由调用方按“延伸到
+    所在容器末尾”处理。
+    """
     first = buf[pos]
     for length in range(1, 9):
         if first & (0x80 >> (length - 1)):
@@ -52,6 +57,10 @@ def read_vint(buf: bytes, pos: int) -> tuple[int, int]:
     value = first & (0x7F >> (length - 1))
     for i in range(1, length):
         value = (value << 8) | buf[pos + i]
+    # 长度标记位之外的数据位全 1 即“未知大小”：n 字节 VINT 的数据位共
+    # 7*n 位，全 1 时数值恰为 2**(7*n) - 1。
+    if value == (1 << (7 * length)) - 1:
+        return None, pos + length
     return value, pos + length
 
 
@@ -74,11 +83,16 @@ def parse_elements(buf: bytes) -> List[EbmlElement]:
     while pos < len(buf):
         element_id, after_id = read_element_id(buf, pos)
         size, after_size = read_vint(buf, after_id)
-        end = after_size + size
-        if end > len(buf):
-            raise ValueError(
-                f"元素 0x{element_id:X} 声明 size={size} 超出边界"
-            )
+        if size is None:
+            # 未知大小元素：负载延伸到所在缓冲末尾。流式 MKV 中只有
+            # 顶层 Segment 这样写，因此它必然是该层级最后一个元素。
+            end = len(buf)
+        else:
+            end = after_size + size
+            if end > len(buf):
+                raise ValueError(
+                    f"元素 0x{element_id:X} 声明 size={size} 超出边界"
+                )
         elements.append(
             EbmlElement(element_id, buf[after_size:end], pos, end)
         )

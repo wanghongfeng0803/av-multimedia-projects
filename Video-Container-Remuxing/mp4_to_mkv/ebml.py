@@ -32,11 +32,16 @@ def encode_vint(value: int, *, unknown: bool = False) -> bytes:
     """把非负整数编码为 EBML VINT（最短表示）。
 
     :param value: 待编码的非负整数。
-    :param unknown: 为 True 时编码“未知大小” VINT（全 1 数据位，
-        如 8 字节的 ``0xFF FF ... FF``），此时忽略 value。
+    :param unknown: 为 True 时编码“未知大小” VINT（数据位全 1）。
+        长度由首字节前导 0 的个数决定，因此 8 字节未知大小 VINT 的
+        首字节是长度标记 ``0x01``（标记位落在最低位），后随 7 个
+        ``0xFF``，即 ``0x01 0xFF×7``——与 ffmpeg/mkvmerge 的流式
+        Segment 头一致。注意不能写成 ``0xFF×8``：其首字节 ``0xFF``
+        是 1 字节 VINT（数据位 7 个全 1，即 1 字节未知大小），无法
+        表达 8 字节宽度。
     """
     if unknown:
-        return b"\xff" * 8
+        return b"\x01" + b"\xff" * 7
     if value < 0:
         raise EbmlEncodeError(f"VINT 不能表示负数: {value}")
     for idx, width in enumerate(_VINT_DATA_WIDTH):

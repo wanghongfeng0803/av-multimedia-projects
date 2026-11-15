@@ -67,13 +67,19 @@ python -m mp4_to_mkv input.mp4 output.mkv [--overwrite]
 
 ```bash
 python remux_all_tracks.py input.mp4 output.mkv [--overwrite]
-                           [--retries N] [--retry-delay SECONDS]
+                           [--retries N] [--retry-delay SECONDS] [--temp]
 ```
+
+`python -m mp4_to_mkv` 基础入口同样接受 `--temp`。默认流式直写；
+`--temp` 切换为“`.part` 临时文件 + 原子替换”，覆盖过程中目标始终完整。
 
 重试策略：仅对**瞬时性 I/O 错误**（文件被占用、网络盘抖动等 `OSError`）
 按线性退避重试，默认额外重试 3 次；输入不支持/损坏等**确定性错误**
-（`RemuxError`）立即失败、绝不重试。输出走“临时文件 + 原子替换”，
-失败自动清理半成品。退出码：`0` 成功，`2` 输入无效，`3` 重试用尽。
+（`RemuxError`）立即失败、绝不重试。默认**流式直写**目标文件——
+Segment 用未知大小 VINT、Cluster 逐簇落盘，全程不产生 `.part` 临时文件、
+内存里同一时刻只保留一个簇；写失败自动清理半成品目标。需要覆盖过程也
+保持原子性时加 `--temp`，退回“临时文件 + `os.replace`”。退出码：
+`0` 成功，`2` 输入无效，`3` 重试用尽。
 
 示例：
 
@@ -125,7 +131,7 @@ $ python batch_remux.py mkv_out album
 
 ### Python API
 
-直接使用底层包：
+直接使用底层包。内存路径（一次拼出完整字节，输出带已知大小 Segment）：
 
 ```python
 from mp4_to_mkv.mp4_parser import parse_mp4
@@ -136,6 +142,19 @@ with open("input.mp4", "rb") as f:
 mkv_bytes = write_mkv(mp4)  # 全部 track 一并写出
 with open("output.mkv", "wb") as f:
     f.write(mkv_bytes)
+```
+
+流式路径（无临时文件、内存有界，可写管道等不可寻址流；Segment 用
+未知大小 VINT，块负载与内存路径逐字节等价）：
+
+```python
+from mp4_to_mkv.mp4_parser import parse_mp4
+from mp4_to_mkv.mkv_writer import write_mkv_stream
+
+with open("input.mp4", "rb") as f:
+    mp4 = parse_mp4(f.read())
+with open("output.mkv", "wb") as out:
+    n = write_mkv_stream(mp4, out)   # 逐簇 write，返回写出字节数
 ```
 
 带重试的编排层：
@@ -174,10 +193,12 @@ MP4 字节流
    │  avcC/hvcC/esds → CodecPrivate；edts/elst → 时间轴偏移
    ▼
 Mp4File（tracks + samples，帧数据仍指向原缓冲，零拷贝）
-   │  mkv_writer：
+   │  mkv_writer（两条等价路径，共用样本放置/时间戳/簇切分逻辑）：
    │  · EBML 头 / Info / Tracks（含 CodecDelay、CodecPrivate）
    │  · 跨轨按 DTS 排序、毫秒时间戳换算、AAC priming 计算
    │  · Cluster 切分，SimpleBlock（常规）/ BlockGroup（尾部裁剪）
+   │  · write_mkv：内存拼整份（已知大小 Segment）
+   │  · write_mkv_stream：未知大小 Segment + 逐簇落盘（流式、无临时文件）
    ▼
 MKV 字节流
 ```
@@ -189,6 +210,10 @@ MKV 字节流
   显示时间戳，B 帧重排由解码器依据码流自身的参考关系完成（与 libavformat 一致）。
 - **Cluster 切分**：达到 5 MiB 后在下一个视频关键帧切分，硬上限 100 MiB；
   并保证块的相对时间码不超出 int16 范围。
+- **流式 vs 内存两条写出路径**：块负载、时间戳、轨道与章节完全相同，
+  唯一区别是 Segment 的 size VINT——内存路径写已知大小（最短 VINT），
+  流式路径写 8 字节未知大小 VINT（`0x01 0xFF×7`，与 ffmpeg 直播流一致），
+  Segment 由流末尾隐式闭合，因此无需预知总长度、不 seek、不暂存整份输出。
 - **音频 priming（通用）**：MP4 用 edit list 的 `media_time` 表示编码器
   前导延迟（AAC/AC-3/E-AC-3/MP3 均可能携带），统一转成 MKV 的
   `CodecDelay`（纳秒）；末包被截短的时长差转成 `DiscardPadding`，
@@ -220,6 +245,8 @@ tests/
 ├── test_all_tracks.py      # 全轨道（视频/音频/字幕）结构与无损
 ├── test_retry.py           # 失败重试的边界与清理
 ├── test_batch.py           # 批量发现/规划/故障隔离/CLI（39 个用例）
+├── test_streaming.py       # 流式写出：未知大小 Segment、不可寻址流、
+│                           #   无临时文件、失败清理/重试、两路径等价（18 个用例）
 └── test_integration_ffmpeg.py  # 真实文件 + framemd5 无损验证
 ```
 

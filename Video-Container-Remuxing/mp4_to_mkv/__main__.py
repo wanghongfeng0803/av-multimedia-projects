@@ -25,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="若输出文件已存在则覆盖",
     )
+    parser.add_argument(
+        "--temp",
+        dest="use_temp",
+        action="store_true",
+        help="改用临时文件 + 原子替换写出（默认流式直写，不产生临时文件）",
+    )
     return parser
 
 
@@ -32,7 +38,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         byte_count, sample_count, track_count = remux(
-            args.input, args.output, overwrite=args.overwrite
+            args.input,
+            args.output,
+            overwrite=args.overwrite,
+            use_temp=args.use_temp,
         )
     except RemuxError as exc:
         # 可预期的输入/格式问题：明确的中文提示 + 非零退出码

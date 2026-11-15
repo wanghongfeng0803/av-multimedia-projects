@@ -22,6 +22,14 @@
   预卷样本（与主流工具行为一致）；
 - 字幕轨（TTML 文档直拷、WebVTT 的 vttc 重组）与视频/音频统一按 DTS 交织，
   轨道排列固定为 视频 → 音频 → 字幕。
+
+两条等价的写出路径：
+- :func:`write_mkv`：在内存中拼出完整、带已知大小 Segment 的 MKV 字节串，
+  输出与历史版本逐字节一致，适合小规模数据与需要完整字节的场景；
+- :func:`write_mkv_stream`：面向二进制流的**流式**路径，Segment 采用未知
+  大小 VINT，Cluster 逐簇写入、不产生临时文件、内存有界（同一时刻只持有
+  一个簇），且不 seek，可写入管道等不可寻址流。两条路径共用同一份样本
+  放置、时间戳与簇切分逻辑，块负载逐字节相同。
 """
 
 from __future__ import annotations
@@ -429,99 +437,117 @@ def _modal_duration(track: Track) -> int:
     return max(counts, key=lambda d: (counts[d], d))
 
 
-def _build_clusters(
+def _frame_for(mp4: Mp4File, item: _PlacedSample) -> bytes:
+    """取出一个待写样本的块负载（帧字节）。
+
+    WebVTT 在放置阶段已转换为 cue 正文（长度可能变化）；其它编码按
+    样本偏移从源缓冲切片，零拷贝。到达文件末尾等截断情况明确报错。
+    """
+    if item.frame_override is not None:
+        return item.frame_override
+    frame = mp4.data[item.sample.offset:item.sample.offset + item.sample.size]
+    if len(frame) != item.sample.size:  # 防御性校验，正常不会触发
+        raise RemuxError("读取样本数据时到达文件末尾，源文件可能被截断")
+    return frame
+
+
+def _build_block(mp4: Mp4File, item: _PlacedSample, relative_tc: int) -> bytes:
+    """按样本类型构造单个块（SimpleBlock 或 BlockGroup）。"""
+    frame = _frame_for(mp4, item)
+    if item.discard_padding_ns > 0:
+        # 尾部需裁剪：用 BlockGroup + DiscardPadding 而非 SimpleBlock
+        return _build_block_group(
+            item.track_number,
+            relative_tc,
+            frame,
+            item.duration_ms,
+            item.discard_padding_ns,
+        )
+    if item.is_subtitle:
+        # 字幕块统一用 BlockGroup：BlockDuration 表达 cue 呈现时长，
+        # WebVTT 的 cue id/settings 通过 BlockAdditions 保留
+        return _build_block_group(
+            item.track_number,
+            relative_tc,
+            frame,
+            item.duration_ms,
+            0,
+            item.block_additions,
+        )
+    return _build_simple_block(
+        item.track_number,
+        relative_tc,
+        item.sample.is_keyframe,
+        frame,
+    )
+
+
+def _needs_new_cluster(
+    item: _PlacedSample, have_blocks: bool, cluster_ts: int, cluster_size: int
+) -> bool:
+    """判断给定样本是否应另起一个新簇（切分规则与历史版本完全一致）。"""
+    if not have_blocks:
+        return True
+    relative_tc = item.pts_ms - cluster_ts
+    if not (_BLOCK_TC_MIN <= relative_tc <= _BLOCK_TC_MAX):
+        # 相对时间码装不下 int16，必须开新簇
+        return True
+    if cluster_size >= _HARD_CLUSTER_SIZE:
+        return True
+    if (
+        cluster_size >= _TARGET_CLUSTER_SIZE
+        and item.is_video
+        and item.sample.is_keyframe
+    ):
+        # 达到目标大小后，在下一个视频关键帧处切分
+        return True
+    return False
+
+
+def _iter_cluster_bytes(
     mp4: Mp4File, placed: Sequence[_PlacedSample]
-) -> List[bytes]:
-    clusters: List[bytes] = []
+):
+    """按既定切分规则逐簇生成完整 Cluster 元素字节（生成器）。
+
+    切分规则与历史一次性实现完全一致，区别仅在于这是惰性生成器：
+    每次只在内存里保留**当前一个簇**的块，簇一闭合即可交给流式写出
+    落盘，从而把峰值内存从“整段输出”降到“一个簇”。
+    """
     blocks: List[bytes] = []
     # 首簇基准取 0 与最早 PTS 的较大者：priming 样本（PTS<0）以负相对
     # 时间码落入 Timestamp=0 的首簇，常规样本则从其自身 PTS 起簇。
     cluster_ts = max(0, min(item.pts_ms for item in placed))
     cluster_size = 0
 
-    def flush() -> None:
-        nonlocal blocks, cluster_size
-        if not blocks:
-            return
-        payload = ebml.uint_element(TIMESTAMP, cluster_ts) + b"".join(blocks)
-        clusters.append(ebml.master_element(CLUSTER, [payload]))
-        blocks = []
-        cluster_size = 0
-
     for item in placed:
-        if item.frame_override is not None:
-            # wvtt 已在放置阶段转换为 cue 正文，长度与原样本不同属正常
-            frame = item.frame_override
-        else:
-            frame = mp4.data[item.sample.offset:item.sample.offset + item.sample.size]
-            if len(frame) != item.sample.size:  # 防御性校验，正常不会触发
-                raise RemuxError("读取样本数据时到达文件末尾，源文件可能被截断")
-
-        need_new_cluster = False
-        if not blocks:
-            need_new_cluster = True
-        else:
-            relative_tc = item.pts_ms - cluster_ts
-            if not (_BLOCK_TC_MIN <= relative_tc <= _BLOCK_TC_MAX):
-                # 相对时间码装不下 int16，必须开新簇
-                need_new_cluster = True
-            elif cluster_size >= _HARD_CLUSTER_SIZE:
-                need_new_cluster = True
-            elif (
-                cluster_size >= _TARGET_CLUSTER_SIZE
-                and item.is_video
-                and item.sample.is_keyframe
-            ):
-                # 达到目标大小后，在下一个视频关键帧处切分
-                need_new_cluster = True
-
-        if need_new_cluster and blocks:
-            flush()
-        if not blocks:
+        if _needs_new_cluster(item, bool(blocks), cluster_ts, cluster_size):
+            if blocks:
+                payload = (
+                    ebml.uint_element(TIMESTAMP, cluster_ts) + b"".join(blocks)
+                )
+                yield ebml.master_element(CLUSTER, [payload])
+                blocks = []
+                cluster_size = 0
             # 新簇基准必须非负（Cluster Timestamp 是无符号整数）
             cluster_ts = max(0, item.pts_ms)
 
         relative_tc = item.pts_ms - cluster_ts
-        if item.discard_padding_ns > 0:
-            # 尾部需裁剪：用 BlockGroup + DiscardPadding 而非 SimpleBlock
-            block = _build_block_group(
-                item.track_number,
-                relative_tc,
-                frame,
-                item.duration_ms,
-                item.discard_padding_ns,
-            )
-        elif item.is_subtitle:
-            # 字幕块统一用 BlockGroup：BlockDuration 表达 cue 呈现时长，
-            # WebVTT 的 cue id/settings 通过 BlockAdditions 保留
-            block = _build_block_group(
-                item.track_number,
-                relative_tc,
-                frame,
-                item.duration_ms,
-                0,
-                item.block_additions,
-            )
-        else:
-            block = _build_simple_block(
-                item.track_number,
-                relative_tc,
-                item.sample.is_keyframe,
-                frame,
-            )
+        block = _build_block(mp4, item, relative_tc)
         blocks.append(block)
         cluster_size += len(block)
 
-    flush()
-    return clusters
+    if blocks:
+        payload = ebml.uint_element(TIMESTAMP, cluster_ts) + b"".join(blocks)
+        yield ebml.master_element(CLUSTER, [payload])
 
 
-def write_mkv(mp4: Mp4File) -> bytes:
-    """把已解析的 :class:`Mp4File` 重封装为完整 MKV 字节串。"""
-    if not mp4.tracks:
-        raise RemuxError("MP4 中没有可写入的 track")
+def _order_tracks(
+    mp4: Mp4File,
+) -> tuple[List[Track], List[int], List[bool]]:
+    """计算轨道排列：视频 → 音频 → 字幕，同类保持源顺序，轨道号从 1 开始。
 
-    # 轨道排列：视频 → 音频 → 字幕；同类保持源顺序。轨道号从 1 开始。
+    :return: (排序后的轨道, 对应的 1 起始 MKV 轨道号, 各轨是否为该类默认轨)。
+    """
     def _track_order(track: Track) -> int:
         if track.is_video:
             return 0
@@ -542,6 +568,21 @@ def write_mkv(mp4: Mp4File) -> bytes:
         )
         default_flags.append(not seen[kind])
         seen[kind] = True
+    return ordered_tracks, track_numbers, default_flags
+
+
+def _prepare_segment(mp4: Mp4File):
+    """计算内存路径与流式路径共用的全部前置结构。
+
+    :return: ``(ebml_header, segment_prefix, placed, duration_ms)``，其中
+        ``segment_prefix`` 是 Segment 内、Cluster 之前的全部一级元素
+        （Info + Tracks + 可选 Chapters），两条写出路径复用同一字节，
+        保证流式输出与内存输出在结构层面完全等价。
+    """
+    if not mp4.tracks:
+        raise RemuxError("MP4 中没有可写入的 track")
+
+    ordered_tracks, track_numbers, default_flags = _order_tracks(mp4)
 
     header = _build_ebml_header()
     placed = _place_samples(mp4, ordered_tracks, track_numbers)
@@ -566,8 +607,76 @@ def write_mkv(mp4: Mp4File) -> bytes:
         if getattr(mp4, "chapters", None)
         else b""
     )
-    clusters = _build_clusters(mp4, placed)
+    segment_prefix = info + tracks + chapters
+    return header, segment_prefix, placed, duration_ms
 
-    segment_payload = info + tracks + chapters + b"".join(clusters)
-    segment = ebml.master_element(SEGMENT, [segment_payload])
+
+def write_mkv(mp4: Mp4File) -> bytes:
+    """把已解析的 :class:`Mp4File` 重封装为完整 MKV 字节串。
+
+    一次性在内存中拼好整个文档（含已知大小的 Segment），适合小规模数据
+    与需要拿到完整字节的场景（如测试、哈希比对）。其输出与历史版本
+    逐字节兼容。
+    """
+    header, segment_prefix, placed, _duration = _prepare_segment(mp4)
+    clusters = b"".join(_iter_cluster_bytes(mp4, placed))
+    segment = ebml.master_element(SEGMENT, [segment_prefix + clusters])
     return header + segment
+
+
+def write_mkv_stream(mp4: Mp4File, stream) -> int:
+    """把 :class:`Mp4File` 以**流式**方式写入二进制流，不产生临时文件。
+
+    与 :func:`write_mkv` 的区别：
+
+    - Segment 使用 **未知大小（unknown-size）VINT** 头（8 字节，
+      ``0x01`` 后随 7 个 ``0xFF``），因此无需预知总长度、无需先在内存或
+      磁盘上拼出整份文档，这是 Matroska 规范允许的流式/直播布局，
+      ffmpeg、mkvmerge 等均可正常读取；
+    - Info/Tracks/Chapters 前缀只构造一次，随后 Cluster **逐簇**写入，
+      内存里同一时刻只保留当前一个簇（上界即簇切分的硬上限），峰值内存
+      与输出总大小无关；
+    - 全程只调用 ``stream.write``，**不 seek、不 flush 之外的定位操作**，
+      因此管道、套接字等不可寻址流同样适用。
+
+    :param stream: 任意提供 ``write(bytes) -> int`` 的二进制对象。
+    :return: 实际写入流的字节总数。
+    :raises RemuxError: 输入不含可写轨道，或样本数据被截断等确定性错误。
+    :raises OSError: 底层流写入失败（如磁盘满、管道关闭），原样上抛，
+        由编排层判定是否值得重试，并负责清理半成品目标文件。
+    """
+    header, segment_prefix, placed, _duration = _prepare_segment(mp4)
+
+    written = 0
+
+    def _emit(chunk: bytes) -> None:
+        nonlocal written
+        if not chunk:
+            return
+        view = memoryview(chunk)
+        # 循环写以兼容只接受有限长度、或 write 短写的类文件对象
+        while view:
+            n = stream.write(view)
+            if n is None:  # 部分实现（如 io.TextIO）不返回写计数，按整段处理
+                n = len(view)
+            if n <= 0:
+                raise RemuxError("输出流未接受任何字节，写出中止")
+            view = view[n:]
+            written += n
+
+    # EBML 文档头
+    _emit(header)
+    # 未知大小的 Segment 头：ID + 8 字节未知大小 VINT（0x01 0xFF×7）。
+    # 之后写入的 Info/Tracks/Chapters/Cluster 都成为该 Segment 的子元素，
+    # 直到流结束（EOF）隐式闭合，无需回填长度，天然适合单向流式写出。
+    _emit(ebml.unknown_size_header(SEGMENT))
+    _emit(segment_prefix)
+    # 逐簇落盘：生成器每次只物化一个 Cluster，写完即可被回收
+    for cluster in _iter_cluster_bytes(mp4, placed):
+        _emit(cluster)
+
+    # 让缓冲型流（真实文件对象）尽快落盘；不支持 flush 的自定义流容错跳过
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        flush()
+    return written

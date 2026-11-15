@@ -35,7 +35,18 @@ class VintTests(unittest.TestCase):
             ebml.encode_vint(-1)
 
     def test_unknown_size(self):
-        self.assertEqual(ebml.encode_vint(0, unknown=True), b"\xff" * 8)
+        # 8 字节未知大小 VINT：首字节 0x01 是“8 字节宽”的长度标记
+        # （前导 7 个 0 + 标记位 1），其后 7 字节数据位全 1。
+        # 与 ffmpeg 流式 Matroska 的 Segment 头逐字节一致。
+        self.assertEqual(ebml.encode_vint(0, unknown=True), b"\x01" + b"\xff" * 7)
+
+    def test_unknown_size_distinct_from_one_byte_all_ones(self):
+        # 0xFF 是 1 字节 VINT（值 0x7F，即 1 字节未知大小），
+        # 绝不能与 8 字节未知大小编码混淆。
+        self.assertEqual(ebml.encode_vint(0x7F), b"\xff")
+        self.assertNotEqual(
+            ebml.encode_vint(0, unknown=True), b"\xff" * 8
+        )
 
 
 class ElementIdTests(unittest.TestCase):
