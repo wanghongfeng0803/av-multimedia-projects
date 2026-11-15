@@ -10,6 +10,7 @@ from subburn.cli import main
 if __name__ == "__main__":
     argv = sys.argv[1:]
     if argv and argv[0] not in ("burn", "burn-track", "tracks",
+                                "shift", "retime",
                                 "-h", "--help", "--version"):
         argv = ["burn", *argv]
     raise SystemExit(main(argv))

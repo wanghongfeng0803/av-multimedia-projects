@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,7 +25,14 @@ from .ass import ASSParseError, parse_ass
 from .fonts import load_font
 from .pipeline import burn_ass, burn_subtitles, burn_track
 from .render import Style
-from .srt import parse_srt_file
+from .srt import parse_srt_file, write_srt_file
+from .time_map import (
+    EASINGS,
+    SpeedKeyframe,
+    TimeWarper,
+    remap_cues,
+    shift_cues,
+)
 from .tracks import TrackError, probe_subtitle_tracks
 from .style import (
     Color,
@@ -127,6 +135,57 @@ def _build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--json", action="store_true", help="以 JSON 输出结果摘要")
     bt.add_argument("-y", "--overwrite", action="store_true",
                     help="覆盖已存在的输出")
+
+    # -- 时间轴变换：不碰视频，只改写 SRT 时间戳 --------------------------
+    shift = sub.add_parser(
+        "shift",
+        help="字幕时间轴整体平移（支持正负偏移、越界裁剪截断、区间重排）",
+    )
+    shift.add_argument("srt", metavar="subtitle", help="输入 SRT 字幕路径")
+    shift.add_argument("-o", "--output", help="输出 SRT 路径（默认 <名>_shifted.srt）")
+    shift.add_argument("--offset", type=float, required=True,
+                       help="统一偏移毫秒数，可正可负（如 1500 / -500）")
+    shift.add_argument("--lower", type=float, default=0.0,
+                       help="新时间轴下界毫秒，默认 0；传负数可保留负时间戳")
+    shift.add_argument("--no-lower", action="store_true",
+                       help="不设下界，负时间戳原样保留（写出 SRT 仍需非负）")
+    shift.add_argument("--upper", type=float, default=None,
+                       help="新时间轴上界毫秒（通常为视频时长），默认不限制")
+    shift.add_argument("--fix-overlaps", action="store_true",
+                       help="对输入自带的重叠区间做确定性让位修复")
+    shift.add_argument("--strict", action="store_true",
+                       help="SRT 解析异常时直接报错而非容忍恢复")
+    shift.add_argument("-y", "--overwrite", action="store_true",
+                       help="覆盖已存在的输出")
+    shift.add_argument("--json", action="store_true", help="以 JSON 输出结果摘要")
+
+    rt = sub.add_parser(
+        "retime",
+        help="按速度曲线对字幕时间轴做非线性重映射（分段线性/缓动）",
+    )
+    rt.add_argument("srt", metavar="subtitle", help="输入 SRT 字幕路径")
+    rt.add_argument("-o", "--output", help="输出 SRT 路径（默认 <名>_retimed.srt）")
+    rt.add_argument("--curve", required=True,
+                    help=(
+                        "速度曲线 JSON：关键帧数组，元素为 "
+                        '{"t": 毫秒, "speed": 倍率(>=0), '
+                        '"easing": 线性/缓动名(可选)}，如 '
+                        '\'[{"t":0,"speed":1},{"t":5000,"speed":2,'
+                        '"easing":"ease_in_out"},{"t":10000,"speed":1}]\''
+                    ))
+    rt.add_argument("--lower", type=float, default=0.0,
+                    help="新时间轴下界毫秒，默认 0")
+    rt.add_argument("--no-lower", action="store_true",
+                    help="不设下界，允许映射到负时间轴")
+    rt.add_argument("--upper", type=float, default=None,
+                    help="新时间轴上界毫秒，默认不限制")
+    rt.add_argument("--no-fix-overlaps", action="store_true",
+                    help="关闭重叠自动让位（默认开启，保证结果互不重叠）")
+    rt.add_argument("--strict", action="store_true",
+                    help="SRT 解析异常时直接报错而非容忍恢复")
+    rt.add_argument("-y", "--overwrite", action="store_true",
+                    help="覆盖已存在的输出")
+    rt.add_argument("--json", action="store_true", help="以 JSON 输出结果摘要")
     return parser
 
 
@@ -227,6 +286,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_tracks(args)
     if args.command == "burn-track":
         return _run_burn_track(args)
+    if args.command == "shift":
+        return _run_shift(args)
+    if args.command == "retime":
+        return _run_retime(args)
     is_ass = _is_ass_file(args.srt)
 
     if is_ass:
@@ -444,6 +507,149 @@ def _run_burn_track(args: argparse.Namespace) -> int:
               f"{result.frames_written} 帧, {result.cues} 条字幕"
               f"{', 含音频' if result.had_audio else ', 无音频'})")
     return 0
+
+
+def _progress_printer(label: str, as_json: bool):
+    """构造时间轴变换用的进度回调：人读模式走 stderr 百分比行。"""
+    last_pct = -1
+
+    def on_progress(ratio: float) -> None:
+        nonlocal last_pct
+        pct = int(ratio * 100)
+        if pct != last_pct and not as_json:
+            last_pct = pct
+            print(f"\r{label}进度: {pct:3d}%", end="", file=sys.stderr,
+                  flush=True)
+    return on_progress
+
+
+def _load_srt_for_transform(args: argparse.Namespace):
+    """两个时间轴子命令共用的 SRT 读取与诊断输出。"""
+    try:
+        cues, warnings = parse_srt_file(args.srt, strict=args.strict)
+    except OSError as exc:
+        print(f"错误: 无法读取字幕文件: {exc}", file=sys.stderr)
+        return None, None, 1
+    for msg in warnings:
+        print(f"[warn] {msg}", file=sys.stderr)
+    return cues, warnings, 0
+
+
+def _emit_transform_result(
+    args: argparse.Namespace, output: str, result, warnings: list[str],
+    mode: str, extra: dict | None = None,
+) -> int:
+    """变换落盘 + 人读/JSON 摘要；负时间戳等写出错误统一转退出码 2。"""
+    try:
+        write_srt_file(output, result.cues)
+    except ValueError as exc:
+        print(f"\n错误: 结果无法写成合法 SRT: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"\n错误: 写出失败: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "mode": mode,
+        "input": args.srt,
+        "output": output,
+        "input_count": result.input_count,
+        "output_count": result.output_count,
+        "dropped": result.dropped,
+        "truncated": result.truncated,
+        "overlaps_fixed": result.overlaps_fixed,
+        "warnings": [*warnings, *result.warnings],
+    }
+    if extra:
+        payload.update(extra)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n完成: {output}（{result.input_count} 条 -> "
+              f"{result.output_count} 条，截断 {result.truncated}，"
+              f"丢弃 {result.dropped}，重叠修复 {result.overlaps_fixed}）")
+        for msg in result.warnings:
+            print(f"[warn] {msg}", file=sys.stderr)
+    return 0
+
+
+def _run_shift(args: argparse.Namespace) -> int:
+    """``shift`` 子命令：整体平移 + 越界裁剪截断 + 区间重排。"""
+    cues, warnings, err = _load_srt_for_transform(args)
+    if err:
+        return err
+    output = args.output or str(
+        Path(args.srt).with_name(Path(args.srt).stem + "_shifted.srt")
+    )
+    if os.path.exists(output) and not args.overwrite:
+        print(f"错误: 输出已存在（需 -y 覆盖）: {output}", file=sys.stderr)
+        return 1
+    lower = None if args.no_lower else args.lower
+    result = shift_cues(
+        cues, args.offset,
+        lower_bound_ms=lower, upper_bound_ms=args.upper,
+        resolve_overlaps=args.fix_overlaps,
+        progress_callback=_progress_printer("平移", args.json),
+    )
+    return _emit_transform_result(
+        args, output, result, warnings, "shift",
+        extra={"offset_ms": args.offset},
+    )
+
+
+def _parse_curve(text: str) -> TimeWarper:
+    """解析 ``--curve`` JSON 为 :class:`TimeWarper`，错误信息面向命令行用户。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"速度曲线不是合法 JSON: {exc}") from exc
+    if not isinstance(data, list) or len(data) < 2:
+        raise ValueError("速度曲线必须是至少含两个关键帧的 JSON 数组")
+    frames: list[SpeedKeyframe] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict) or "t" not in item or "speed" not in item:
+            raise ValueError(
+                f"第 {i} 个关键帧必须是含 t 与 speed 字段的对象: {item!r}"
+            )
+        easing = item.get("easing", "linear")
+        if easing not in EASINGS:
+            raise ValueError(
+                f"第 {i} 个关键帧缓动 {easing!r} 不存在，"
+                f"可选: {', '.join(sorted(EASINGS))}"
+            )
+        frames.append(SpeedKeyframe(
+            t_ms=float(item["t"]), speed=float(item["speed"]), easing=easing,
+        ))
+    return TimeWarper.from_speed_curve(frames)
+
+
+def _run_retime(args: argparse.Namespace) -> int:
+    """``retime`` 子命令：速度曲线 -> 单调时间映射 -> 字幕重映射。"""
+    cues, warnings, err = _load_srt_for_transform(args)
+    if err:
+        return err
+    output = args.output or str(
+        Path(args.srt).with_name(Path(args.srt).stem + "_retimed.srt")
+    )
+    if os.path.exists(output) and not args.overwrite:
+        print(f"错误: 输出已存在（需 -y 覆盖）: {output}", file=sys.stderr)
+        return 1
+    try:
+        warper = _parse_curve(args.curve)
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    lower = None if args.no_lower else args.lower
+    result = remap_cues(
+        cues, warper,
+        lower_bound_ms=lower, upper_bound_ms=args.upper,
+        resolve_overlaps=not args.no_fix_overlaps,
+        progress_callback=_progress_printer("重映射", args.json),
+    )
+    return _emit_transform_result(
+        args, output, result, warnings, "retime",
+        extra={"domain_ms": [warper.domain_start, warper.domain_end]},
+    )
 
 
 if __name__ == "__main__":

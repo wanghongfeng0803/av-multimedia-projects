@@ -235,3 +235,109 @@ class TestAssCli:
         rc = main(["burn", str(video), str(ass),
                    "-o", str(tmp_path / "o.mp4"), "--strict"])
         assert rc == 2
+
+
+class TestTransformCli:
+    """shift / retime 子命令端到端测试（纯文件操作，不依赖 ffmpeg）。"""
+
+    def _write_srt(self, tmp_path, name="in.srt"):
+        p = tmp_path / name
+        p.write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\nhello\n\n"
+            "2\n00:00:03,000 --> 00:00:04,000\nworld\n",
+            encoding="utf-8",
+        )
+        return p
+
+    def test_shift_writes_offset_srt(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        out = tmp_path / "o.srt"
+        rc = main(["shift", str(src), "-o", str(out),
+                   "--offset", "1500", "-y", "--json"])
+        assert rc == 0 and out.exists()
+        text = out.read_text(encoding="utf-8")
+        assert "00:00:02,500 --> 00:00:03,500" in text
+        # 序号连续
+        assert text.startswith("1\n") and "\n2\n" in text
+
+    def test_negative_shift_clips_to_lower_bound(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        out = tmp_path / "o.srt"
+        rc = main(["shift", str(src), "-o", str(out),
+                   "--offset", "-1500", "-y"])
+        assert rc == 0
+        # 第一条 [1000,2000)-1500 -> 裁为 [0,500)；第二条 [3000,4000) -> [1500,2500)
+        text = out.read_text(encoding="utf-8")
+        assert "00:00:00,000 --> 00:00:00,500" in text
+        assert "00:00:01,500 --> 00:00:02,500" in text
+
+    def test_shift_default_output_name(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        rc = main(["shift", str(src), "--offset", "100"])
+        assert rc == 0
+        assert (tmp_path / "in_shifted.srt").exists()
+
+    def test_shift_refuses_overwrite_without_flag(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        out = tmp_path / "o.srt"
+        out.write_text("x", encoding="utf-8")
+        rc = main(["shift", str(src), "-o", str(out), "--offset", "100"])
+        assert rc == 1
+
+    def test_shift_all_dropped_writes_empty_srt(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        out = tmp_path / "o.srt"
+        rc = main(["shift", str(src), "-o", str(out),
+                   "--offset", "-99999", "-y"])
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == ""
+
+    def test_retime_speed_curve(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        out = tmp_path / "o.srt"
+        curve = json.dumps([
+            {"t": 0, "speed": 1.0},
+            {"t": 5000, "speed": 1.0},
+        ])
+        rc = main(["retime", str(src), "-o", str(out),
+                   "--curve", curve, "-y"])
+        assert rc == 0
+        text = out.read_text(encoding="utf-8")
+        # 单位斜率恒等映射，时间码不变
+        assert "00:00:01,000 --> 00:00:02,000" in text
+
+    def test_retime_bad_curve_json_rc_2(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        rc = main(["retime", str(src), "-o", str(tmp_path / "o.srt"),
+                   "--curve", "{not json", "-y"])
+        assert rc == 2
+
+    def test_retime_unknown_easing_rc_2(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        curve = json.dumps([
+            {"t": 0, "speed": 1, "easing": "nope"},
+            {"t": 1000, "speed": 1},
+        ])
+        rc = main(["retime", str(src), "-o", str(tmp_path / "o.srt"),
+                   "--curve", curve, "-y"])
+        assert rc == 2
+
+    def test_retime_eased_curve_runs_and_is_nonoverlapping(self, tmp_path):
+        src = self._write_srt(tmp_path)
+        out = tmp_path / "o.srt"
+        curve = json.dumps([
+            {"t": 0, "speed": 0.2, "easing": "ease_in_out"},
+            {"t": 3000, "speed": 3.0, "easing": "smoothstep"},
+            {"t": 6000, "speed": 0.0},
+            {"t": 9000, "speed": 1.0},
+        ])
+        rc = main(["retime", str(src), "-o", str(out),
+                   "--curve", curve, "-y", "--json"])
+        assert rc == 0 and out.exists()
+        # 重新解析产物，钉住有序、正宽度不变量
+        from subburn.srt import parse_srt
+        cues, _ = parse_srt(out.read_text(encoding="utf-8"))
+        for c in cues:
+            assert c.end_ms > c.start_ms
+        for prev, nxt in zip(cues, cues[1:]):
+            assert prev.end_ms <= nxt.start_ms

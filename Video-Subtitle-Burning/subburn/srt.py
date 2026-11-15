@@ -25,10 +25,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import BinaryIO
+from typing import BinaryIO, Sequence
 
 __all__ = ["Cue", "SRTParseError", "normalize_newlines",
-           "parse_srt", "parse_srt_file", "parse_timecode", "decode_srt"]
+           "parse_srt", "parse_srt_file", "parse_timecode", "decode_srt",
+           "format_timecode", "render_srt", "write_srt_file"]
 
 
 class SRTParseError(ValueError):
@@ -279,3 +280,46 @@ def parse_srt_file(
 ) -> tuple[list[Cue], list[str]]:
     """从路径/二进制流一步完成解码与解析。"""
     return parse_srt(read_srt_text(source), strict=strict)
+
+
+# ---------------------------------------------------------------------------
+# 写出：Cue 列表 -> SRT 文本（与解析器对称，同样只依赖标准库）
+# ---------------------------------------------------------------------------
+
+def format_timecode(ms: int) -> str:
+    """把毫秒整数格式化为 SRT 时间码 ``HH:MM:SS,mmm``。
+
+    小时不设上限（长视频可出现 3 位以上小时）；负时间戳在 SRT 规范里
+    没有合法表示，这里直接拒绝，避免写出任何播放器都无法解析的文件。
+    """
+    if ms < 0:
+        raise ValueError(f"SRT 时间码不能为负: {ms}ms")
+    hh, rem = divmod(int(ms), 3_600_000)
+    mm, rem = divmod(rem, 60_000)
+    ss, mmm = divmod(rem, 1000)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{mmm:03d}"
+
+
+def render_srt(cues: Sequence[Cue]) -> str:
+    """把字幕列表渲染为规范 SRT 文本（LF 换行，块间空行分隔）。
+
+    序号按列表顺序从 1 重新分配，不沿用各 :class:`Cue` 自身的 index，
+    使时间轴变换后的重排结果直接得到连续序号；时间码由
+    :func:`format_timecode` 生成，负时间戳会抛出 :class:`ValueError`。
+    """
+    blocks: list[str] = []
+    for i, cue in enumerate(cues, start=1):
+        line = (
+            f"{i}\n"
+            f"{format_timecode(cue.start_ms)} --> {format_timecode(cue.end_ms)}\n"
+            f"{cue.text}"
+        )
+        blocks.append(line)
+    # 末尾保留一个收尾换行，与主流编辑器/导出器的习惯一致
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def write_srt_file(path: str, cues: Sequence[Cue]) -> None:
+    """把字幕列表以 UTF-8（无 BOM）、LF 换行写出为 SRT 文件。"""
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(render_srt(cues))

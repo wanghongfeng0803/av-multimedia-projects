@@ -163,6 +163,41 @@ ffprobe JSON ──► parse_tracks()    纯函数：流元数据 → SubtitleTr
 - **零侵入复用**：抽出的临时字幕文件走既有 `parse_srt_file`/`parse_ass_file`
   与 `burn_subtitles`/`burn_ass`，渲染、调度、编码路径与文件字幕完全一致。
 
+### 6. 时间轴变换（`subburn/time_map.py` + `srt.py` 写出器）
+
+不碰视频、只改写 SRT 时间戳的纯算法模块，零第三方依赖，提供线性平移与
+非线性重映射两类能力，配合新增的 `shift` / `retime` CLI 子命令使用。
+
+**线性平移 `shift_cues(cues, offset_ms)`**：每条字幕起止时间加统一偏移
+（可正可负、可小数毫秒），随后走统一的「端点 floor 取整 → 边界裁剪/截断 →
+零宽丢弃 → 按 `(起点,终点)` 稳定排序并重新编号」管线。下界默认 0，
+`--no-lower` 可保留负时间戳参与计算；上界通常传视频时长。
+
+**非线性重映射 `remap_cues(cues, warper)`**：由速度关键帧
+`SpeedKeyframe(t_ms, speed, easing)` 积分出连续、**单调非减**的时间映射
+`T(t)`。这里的 `speed` 定义为映射斜率 `dT/dt`（新毫秒/旧毫秒）：1 原速、
+0 定格，取斜率而非播放倍率使「定格」对应自然零值、全段无除零。段内速度按
+`v(u)=v0+(v1-v0)·e(u)` 缓动过渡（内置 linear/smoothstep/ease_in/ease_out/
+ease_in_out，均有解析积分；自定义缓动走自适应 Simpson 兜底），新轴跨度
+`dy = dx·(v0 + (v1-v0)·∫e)`，非负速度保证 `dy≥0`，单调性由构造保证。
+定义域之外按端点斜率线性外推，负时刻也能映射。
+
+边界语义与容错：
+
+- **半开区间不变**：映射后 `end <= start` 的条（越界裁空、零速平台压扁、
+  floor 后等宽）一律丢弃并计入 `dropped`；
+- **不重叠保证**：零速平台会把多个旧时刻压到同一新时刻，贪心扫描线
+  `_resolve_overlaps` 让后出现的区间起点让位至前序终点，让位后归零再丢弃，
+  产出严格有序、互不重叠（`remap_cues` 默认开启，可关）；
+- **毫秒精度**：内部全程浮点、落盘统一 floor（负小数向负无穷取整，
+  不用向零截断），200 条以上长列表逐条独立取整无累积漂移；
+- **空结果与脏输入**：空输入产出空 SRT 不报错；不假设输入有序或互不重叠；
+  每次丢弃/截断/修复都进 `TimeMapResult.warnings`，CLI 支持 `--json` 摘要与
+  stderr 百分比进度。
+
+`srt.py` 同时补齐了与解析器对称的写出器 `render_srt` / `write_srt_file`
+（`format_timecode` 拒绝负时间戳，避免写出播放器无法解析的文件）。
+
 ## 环境要求
 
 - Python 3.10+
@@ -186,6 +221,20 @@ python -m subburn burn input.mp4 subs.ass --strict --json -y
 python -m subburn tracks input.mkv
 python -m subburn burn-track input.mkv --lang chi -o out.mp4
 python -m subburn burn-track input.mkv --stream 3 --json -y
+
+# 时间轴平移：整体延后 1.5s（负偏移用 --offset -500），越界自动裁剪截断
+python -m subburn shift subs.srt --offset 1500 -o shifted.srt -y
+# 限定在视频时长内、保留负时间戳参与计算、修复输入自带的重叠
+python -m subburn shift subs.srt --offset -500 --upper 120000 \
+    --no-lower --fix-overlaps --json
+
+# 非线性重映射：速度曲线 JSON（t=旧轴毫秒，speed=dT/dt 斜率，easing 可选）
+# 前 3s 缓动加速到 2 倍流速，3~6s 平滑回落，定格可用 speed=0
+python -m subburn retime subs.srt -o retimed.srt -y --curve '[
+  {"t":0,"speed":0.5,"easing":"ease_in_out"},
+  {"t":3000,"speed":2.0,"easing":"smoothstep"},
+  {"t":6000,"speed":1.0}
+]'
 ```
 
 ASS 的样式与特效完全由字幕文件内的 `[V4+ Styles]` 与行内标签决定，
@@ -275,8 +324,9 @@ print(result.track)                               # 实际烧录的轨摘要
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest          # 280+ 用例：SRT/ASS 解析、样式系统、字体回退、
-                          # 混合数学、卡拉OK/淡入/定位特效、多轨选择、ffmpeg 端到端
+python -m pytest          # 340+ 用例：SRT/ASS 解析、样式系统、字体回退、
+                          # 混合数学、卡拉OK/淡入/定位特效、多轨选择、
+                          # 时间轴平移/重映射、ffmpeg 端到端
 python -m doctest subburn/srt.py
 ```
 
@@ -286,16 +336,17 @@ python -m doctest subburn/srt.py
 
 ```
 subburn/
-  srt.py        SRT：编码探测、换行归一化、时间码、四态状态机
+  srt.py        SRT：编码探测、换行归一化、时间码、四态状态机、SRT 写出器
   ass.py        ASS/SSA：段解析、&HAABBGGRR 颜色、覆盖标签状态机、样式表
   timeline.py   帧时间轴与半开区间字幕调度（SRT/ASS 共用）
+  time_map.py   时间轴平移 + 速度曲线非线性重映射（缓动积分、裁剪、不重叠修复）
   style.py      样式数据结构：Color/FontSpec(含斜体)/FontWeight/Position
   fonts.py      位图字体(含斜体切变) + Pillow TTF + 字体族注册表与回退链
   render.py     SRT 排版、瓦片缓存、RGBA 源覆盖混合
   ass_render.py ASS 排版：多样式 run、numpad 定位、卡拉OK/淡入/\move、底盒
   pipeline.py   ffprobe 探测、解码/编码双进程逐帧泵、音频直通、多轨烧录
   tracks.py     内嵌字幕轨枚举、元数据归一化、目标轨定位与抽取
-  cli.py        命令行入口（格式自动识别，SRT 样式参数 ASS 模式拒绝）
+  cli.py        命令行入口（burn/tracks/burn-track/shift/retime）
 tests/          单元测试 + ffmpeg 端到端集成测试
 demo/           示例视频、SRT 与 ASS 样例
 ```
@@ -313,4 +364,7 @@ demo/           示例视频、SRT 与 ASS 样例
   （仅 `\\N` 硬换行生效，`\\q` 忽略）、不实现 `\\p` 矢量绘图（绘图文本
   丢弃）、不支持旋转 `\\fr`、模糊 `\\blur`、`\\t` 动画、逐字 3D 变换；
   卡拉OK 的 `\\kf`/`\\K` 扫光按到点整体变色近似，不做逐像素扫过动画；
-- 输出编码固定为 H.264/yuv420p（容器可选 MP4/MKV）。
+- 输出编码固定为 H.264/yuv420p（容器可选 MP4/MKV）；
+- 时间轴变换（`shift`/`retime`）目前只支持 SRT 输入输出，ASS 对话行的
+  时间戳未接入；变换只移动区间端点，不重采样字幕文本内容；负时间戳可在
+  库函数中保留并参与计算，但 SRT 规范无合法表示，写出时会明确报错（rc=2）。
