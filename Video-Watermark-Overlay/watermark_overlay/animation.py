@@ -125,6 +125,45 @@ class MotionState:
     angle: float  # 已归一化到 [0, 360)
 
 
+def motion_from_dict(data: object) -> "MotionConfig":
+    """从 JSON 风格字典构建 :class:`MotionConfig` 并校验。
+
+    期望格式：``{"keyframes": [{"time": 0, "x": 0, "y": 0, "angle": 0}, ...],
+    "easing": "linear", "anchor_x": 0.5, "anchor_y": 0.5}``，
+    格式非法统一抛出 :class:`InvalidParameterError`。
+    """
+    if not isinstance(data, dict):
+        raise InvalidParameterError("运动配置必须是 JSON 对象")
+    raw_keyframes = data.get("keyframes")
+    if not isinstance(raw_keyframes, list):
+        raise InvalidParameterError("运动配置缺少 keyframes 数组")
+
+    keyframes = []
+    for i, item in enumerate(raw_keyframes):
+        if not isinstance(item, dict) or "time" not in item:
+            raise InvalidParameterError(f"第 {i} 个关键帧必须是含 time 字段的对象")
+        try:
+            keyframes.append(
+                Keyframe(
+                    time=item["time"],
+                    x=item.get("x", 0.0),
+                    y=item.get("y", 0.0),
+                    angle=item.get("angle", 0.0),
+                )
+            )
+        except TypeError as exc:
+            raise InvalidParameterError(f"第 {i} 个关键帧字段非法：{exc}") from exc
+
+    motion = MotionConfig(
+        keyframes=keyframes,
+        easing=data.get("easing", "linear"),
+        anchor_x=data.get("anchor_x", 0.5),
+        anchor_y=data.get("anchor_y", 0.5),
+    )
+    motion.validate()
+    return motion
+
+
 @dataclass
 class MotionConfig:
     """水印运动配置：按时间排序的关键帧序列 + 全局缓动 + 旋转锚点。
