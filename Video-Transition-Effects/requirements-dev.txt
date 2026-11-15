@@ -1,0 +1,2 @@
+# 运行测试需要（工具本身仅依赖 Python 标准库 + 系统 ffmpeg/ffprobe）
+pytest>=7.0
