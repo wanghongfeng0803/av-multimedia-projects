@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 工作产物（追踪 JSON、渲染视频、抽帧、测试媒体）
+build/
+*.json.tmp
