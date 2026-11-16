@@ -1,13 +1,16 @@
-"""vdenoise：视频降噪（零三方依赖），均值、中值、时域三种模式。
+"""vdenoise：视频降噪（零三方依赖），均值、中值、时域、空时联合四种模式。
 
-流水线：ffmpeg 解码 → 滤波（空间分带 / 时域帧缓存）→ ffmpeg 编码，
-音轨 ``-c:a copy`` 直通，像素格式自适应（RGB 工作格式自动切换
-libx264rgb）。
+流水线：ffmpeg 解码 → 滤波（空间分带 / 时域帧缓存 / 空时联合）→
+ffmpeg 编码，音轨 ``-c:a copy`` 直通，像素格式自适应（RGB 工作格式
+自动切换 libx264rgb）。
 
 - 均值模式（默认）：可分离盒式滤波（分带 + 接缝加权合并）；
 - 中值模式：Huang 直方图加速中值滤波，镜像边界，专治椒盐噪声；
 - 时域模式：全局位移估计对齐后再做时间窗混合，运动区掩码防拖影，
-  缓存帧数 / 片长 / 内存预算三者互推、超预算提前拒绝。
+  缓存帧数 / 片长 / 内存预算三者互推、超预算提前拒绝；
+- 空时联合模式：对齐残差转亮度软权重（掩码复用前级估计），权重图
+  边缘平滑、色度重采样，带内时间加权融合后紧接空间盒式均值，
+  帧缓存与权重图均有界，内存不随片长涨，输出前后 MAD 指标对比。
 """
 
 from .filter import horizontal_pass_row, vertical_pass, box_blur_plane
@@ -31,6 +34,21 @@ from .temporal import (
     plan_temporal,
     temporal_blend_plane_banded,
     temporal_memory_bytes,
+)
+from .spatiotemporal import (
+    DEFAULT_MASK_RADIUS,
+    DEFAULT_SPATIAL_RADIUS,
+    WEIGHT_SCALE,
+    FrameCache as STFrameCache,
+    derive_band_height as st_derive_band_height,
+    derive_cache_frames as st_derive_cache_frames,
+    fuse_band,
+    motion_weight_map,
+    plan_spatiotemporal,
+    process_plane,
+    resample_weight_map,
+    smooth_weight_map,
+    spatiotemporal_memory_bytes,
 )
 from .memory import available_memory, derive_budget
 from .pixfmt import (
@@ -73,6 +91,20 @@ __all__ = [
     "temporal_blend_plane_banded",
     "MAX_CACHE_FRAMES",
     "DEFAULT_MOTION_THRESHOLD",
+    # spatiotemporal（空时联合）
+    "STFrameCache",
+    "plan_spatiotemporal",
+    "spatiotemporal_memory_bytes",
+    "st_derive_cache_frames",
+    "st_derive_band_height",
+    "motion_weight_map",
+    "smooth_weight_map",
+    "resample_weight_map",
+    "fuse_band",
+    "process_plane",
+    "DEFAULT_SPATIAL_RADIUS",
+    "DEFAULT_MASK_RADIUS",
+    "WEIGHT_SCALE",
     # memory
     "available_memory",
     "derive_budget",

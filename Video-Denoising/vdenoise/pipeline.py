@@ -43,11 +43,21 @@ from .temporal import (
     plan_temporal,
     temporal_blend_plane_banded,
 )
+from .spatiotemporal import (
+    DEFAULT_MASK_RADIUS,
+    DEFAULT_SPATIAL_RADIUS,
+    WEIGHT_SCALE,
+    motion_weight_map,
+    plan_spatiotemporal,
+    process_plane,
+    smooth_weight_map,
+)
+from .filter import box_blur_plane
 
 __all__ = ["probe", "denoise_video", "PipelineError"]
 
 #: 支持的滤波模式
-FILTER_MODES = ("mean", "median", "temporal")
+FILTER_MODES = ("mean", "median", "temporal", "spatiotemporal")
 
 
 class PipelineError(RuntimeError):
@@ -117,7 +127,9 @@ def denoise_video(src, dst, radius=2, budget_bytes=None, progress=None,
                   mode="mean", window=None, border_dir=None,
                   temporal_radius=2, max_shift=6,
                   motion_threshold=DEFAULT_MOTION_THRESHOLD,
-                  max_cache_frames=MAX_CACHE_FRAMES, band_height=None):
+                  max_cache_frames=MAX_CACHE_FRAMES, band_height=None,
+                  spatial_radius=DEFAULT_SPATIAL_RADIUS,
+                  mask_radius=DEFAULT_MASK_RADIUS):
     """对 ``src`` 做空间/时域滤波降噪，结果写入 ``dst``，音轨原样保留。
 
     ``radius`` 为空间滤波半径（窗口 (2r+1)²）；``budget_bytes`` 为
@@ -140,6 +152,14 @@ def denoise_video(src, dst, radius=2, budget_bytes=None, progress=None,
       行数）、缓存帧数、预算三者由 :func:`plan_temporal` 互推，超预算
       在启动 ffmpeg 前抛 :class:`MemoryError`。``band_height`` 可显式
       指定片长，缺省在预算内取最大片长。
+    - ``"spatiotemporal"``：空时联合降噪。时间窗与全局对齐流程同
+      ``"temporal"``，但把硬掩码升级为按对齐残差分配的软权重
+      （阈值内满权、阈值到 2 倍阈值线性降为 0），权重图只在亮度平面
+      对每个参考帧构造一次（掩码复用前级位移估计的残差，不二次估计），
+      经 ``mask_radius`` 小半径均值平滑消除运动边界块状，色度平面按
+      采样比块平均重采样同一张图；带内时间加权融合后紧接空间盒式均值
+      （``spatial_radius``），运动区时域退化时由空间级补位。帧缓存与
+      权重图均有界，内存不随片长上涨。返回值另含处理前后的 MAD 指标。
     ``border_dir`` 仅在中值模式下有效：给出目录后，每帧的边界区域
     （距边缘 <= 半径的像素，掩码外置 0）以工作格式原始字节落盘，
     文件名 ``frame_XXXXXX_border.raw``，另写 ``manifest.json``
@@ -158,7 +178,7 @@ def denoise_video(src, dst, radius=2, budget_bytes=None, progress=None,
                 raise ValueError("中值窗口边长必须为正奇数")
             radius = (window - 1) // 2
         # window 缺省时沿用 radius；radius=0 即 1x1 中值，退化为恒等
-    if mode == "temporal":
+    if mode in ("temporal", "spatiotemporal"):
         if temporal_radius < 0:
             raise ValueError("temporal_radius 不能为负")
         if max_shift < 0:
@@ -169,6 +189,11 @@ def denoise_video(src, dst, radius=2, budget_bytes=None, progress=None,
             raise ValueError("band_height 必须 >= 1")
         if border_dir is not None:
             raise ValueError("border_dir 仅在中值模式下可用")
+        if mode == "spatiotemporal":
+            if spatial_radius < 0:
+                raise ValueError("spatial_radius 不能为负")
+            if mask_radius < 0:
+                raise ValueError("mask_radius 不能为负")
     elif border_dir is not None and mode != "median":
         raise ValueError("border_dir 仅在中值模式下可用")
 
@@ -197,6 +222,22 @@ def denoise_video(src, dst, radius=2, budget_bytes=None, progress=None,
         return _TemporalRunner(
             work, w, h, fsize, dims, plan, max_shift,
             motion_threshold, progress, str(dst),
+        ).run(src, info, codec, out_pix, ffmpeg)
+
+    if mode == "spatiotemporal":
+        # 内存互推与提前拒绝：任何子进程启动之前完成可行性校验
+        plane_sizes = [pw * ph for pw, ph in dims]
+        plane_widths = [pw for pw, _ in dims]
+        plane_heights = [ph for _, ph in dims]
+        plan = plan_spatiotemporal(
+            plane_sizes, plane_widths, plane_heights,
+            temporal_radius, budget_bytes, spatial_radius,
+            max_cache_frames=max_cache_frames,
+            band_height=band_height,
+        )
+        return _SpatiotemporalRunner(
+            work, w, h, fsize, dims, plan, max_shift,
+            motion_threshold, mask_radius, spatial_radius, progress, str(dst),
         ).run(src, info, codec, out_pix, ffmpeg)
 
     if mode == "median":
@@ -466,3 +507,226 @@ class _TemporalRunner:
             enc.stdin.write(join_planes(out_planes, self.work, self.w, self.h))
         except (BrokenPipeError, OSError) as exc:
             raise PipelineError(f"编码器异常退出：{exc}") from exc
+
+
+class _SpatiotemporalRunner:
+    """空时联合流水线：有界缓存 + 延迟发射，内存与总帧数无关。
+
+    输出顺序与 :class:`_TemporalRunner` 严格一致：第 t 帧在读到
+    t+half 帧（或视频结束）时发射，结尾冲刷尾部。区别在每帧的处理：
+    位移估计复用前级粗精块匹配，残差当场转成亮度软权重图并做小半径
+    平滑（每参考帧一张，随帧缓存有界驻留），色度平面重采样同一张图；
+    带内时间加权融合后紧接空间盒式均值。
+
+    指标累计全部为定点整数的流式求和（不额外驻留历史帧）：空间 MAD
+    对照「当前帧亮度的整帧盒式均值」，时域 MAD 对照相邻帧亮度，
+    权重接受率 = 参考帧平均权重 / 满权刻度。
+    """
+
+    def __init__(self, work, w, h, fsize, dims, plan, max_shift,
+                 motion_threshold, mask_radius, spatial_radius,
+                 progress, dst):
+        self.work = work
+        self.w, self.h = w, h
+        self.fsize = fsize
+        self.dims = dims
+        self.plan = plan
+        self.max_shift = max_shift
+        self.motion_threshold = motion_threshold
+        self.mask_radius = mask_radius
+        self.spatial_radius = spatial_radius
+        self.progress = progress
+        self.dst = dst
+
+    def run(self, src, info, codec, out_pix, ffmpeg):
+        cache_cap = self.plan["cache_frames"]
+        radius = self.plan["temporal_radius"]
+        bands_per_plane = self.plan["bands"]
+        spatial_bands = self.plan["spatial_bands"]
+        luma_w, luma_h = self.dims[0]
+        scale_x = [pw / luma_w for pw, _ in self.dims]
+        scale_y = [ph / luma_h for _, ph in self.dims]
+        half = min(radius, (cache_cap - 1) // 2)
+
+        dec = subprocess.Popen(
+            [ffmpeg, "-v", "error", "-i", str(src),
+             "-f", "rawvideo", "-pix_fmt", self.work, "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        enc_cmd = _encoder_command(
+            ffmpeg, self.work, self.w, self.h, info["fps"], codec,
+            out_pix, info["has_audio"], src, self.dst,
+        )
+        enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+
+        raw_cache = deque(maxlen=cache_cap)
+        total = 0
+        emitted = 0
+        # 指标流式累计（仅标量，不随片长增长）
+        prev_in_luma = None
+        prev_out_luma = None
+        m_before_sp = m_after_sp = 0          # 空间 MAD 分子/帧数
+        m_before_tp = m_after_tp = 0          # 时域 MAD 分子/相邻对数
+        tp_pairs = 0
+        weight_sum = weight_cnt = 0           # 权重接受率
+
+        def emit(t):
+            nonlocal prev_in_luma, prev_out_luma
+            nonlocal m_before_sp, m_after_sp, m_before_tp, m_after_tp
+            nonlocal tp_pairs, weight_sum, weight_cnt
+            out_luma, ws, wc = self._emit(
+                raw_cache, total, t, enc, bands_per_plane,
+                spatial_bands, scale_x, scale_y, luma_w, luma_h)
+            weight_sum += ws
+            weight_cnt += wc
+            # 空间 MAD：原始亮度 vs 整帧盒式均值（处理前），
+            # 输出亮度 vs 同一基准（处理后，衡量联合滤波再压下多少高频）
+            start = total - len(raw_cache)
+            in_luma = split_planes(raw_cache[t - start], self.work,
+                                   self.w, self.h)[0][0]
+            base_blur = box_blur_plane(in_luma, luma_w, luma_h,
+                                       self.spatial_radius)
+            m_before_sp += _mad_sum(in_luma, base_blur)
+            m_after_sp += _mad_sum(out_luma, base_blur)
+            # 时域 MAD：相邻帧亮度（处理前 raw / 处理后输出）
+            if prev_in_luma is not None:
+                m_before_tp += _mad_sum(in_luma, prev_in_luma)
+                m_after_tp += _mad_sum(out_luma, prev_out_luma)
+                tp_pairs += 1
+            prev_in_luma = in_luma
+            prev_out_luma = out_luma
+
+        try:
+            while True:
+                buf = _read_exact(dec.stdout, self.fsize)
+                if buf is None:
+                    break
+                raw_cache.append(buf)
+                total += 1
+                ready_t = total - 1 - half
+                while emitted <= ready_t:
+                    emit(emitted)
+                    emitted += 1
+                    if self.progress:
+                        self.progress(emitted)
+            while emitted < total:
+                emit(emitted)
+                emitted += 1
+                if self.progress:
+                    self.progress(emitted)
+        finally:
+            try:
+                if enc.stdin and not enc.stdin.closed:
+                    enc.stdin.close()
+            except OSError:
+                pass
+        dec.stdout.close()
+        dec_rc = dec.wait()
+        enc_rc = enc.wait()
+        if dec_rc != 0:
+            raise PipelineError(f"ffmpeg 解码失败（退出码 {dec_rc}）")
+        if enc_rc != 0:
+            raise PipelineError(f"ffmpeg 编码失败（退出码 {enc_rc}）")
+
+        luma_pixels = luma_w * luma_h
+        metrics = {
+            # 空间高频能量（亮度 MAD，对照同帧盒式均值）
+            "spatial_mad_before": _rounded(m_before_sp, emitted * luma_pixels),
+            "spatial_mad_after": _rounded(m_after_sp, emitted * luma_pixels),
+            # 相邻帧时域跳动（亮度 MAD，首帧无邻帧不计）
+            "temporal_mad_before": _rounded(m_before_tp,
+                                            tp_pairs * luma_pixels),
+            "temporal_mad_after": _rounded(m_after_tp,
+                                           tp_pairs * luma_pixels),
+            # 参考帧权重接受率：平均权重 / 满权刻度，0..1 浮点
+            "weight_accept_ratio": (
+                round(weight_sum / weight_cnt / WEIGHT_SCALE, 4)
+                if weight_cnt else 1.0),
+        }
+        return {
+            "frames": emitted,
+            "pix_fmt": self.work,
+            "width": self.w,
+            "height": self.h,
+            "has_audio": info["has_audio"],
+            "mode": "spatiotemporal",
+            "radius": None,
+            "window": None,
+            "border_dir": None,
+            "temporal_radius": self.plan["temporal_radius"],
+            "spatial_radius": self.spatial_radius,
+            "mask_radius": self.mask_radius,
+            "cache_frames": self.plan["cache_frames"],
+            "nominal_window": self.plan["nominal_window"],
+            "band_height": self.plan["band_height"],
+            "max_shift": self.max_shift,
+            "motion_threshold": self.motion_threshold,
+            "memory_bytes": self.plan["memory_bytes"],
+            "metrics": metrics,
+        }
+
+    def _emit(self, raw_cache, total, t, enc, bands_per_plane,
+              spatial_bands, scale_x, scale_y, luma_w, luma_h):
+        """发射第 t 帧，返回 (输出亮度平面, 权重和, 权重计数)。"""
+        r = self.plan["temporal_radius"]
+        lo = max(0, t - r)
+        hi = min(total - 1, t + r)
+        start = total - len(raw_cache)
+        target_buf = raw_cache[t - start]
+        target_planes, _ = split_planes(target_buf, self.work, self.w, self.h)
+        ref_bufs = [
+            raw_cache[j - start] for j in range(lo, hi + 1) if j != t
+        ]
+        ref_plane_sets = [
+            split_planes(buf, self.work, self.w, self.h)[0]
+            for buf in ref_bufs
+        ]
+
+        # 位移以亮度为准估计（复用前级块匹配），残差当场转软权重图
+        tgt_luma = target_planes[0]
+        luma_shifts = []
+        luma_weights = []
+        weight_sum = 0
+        weight_cnt = 0
+        for ref_planes in ref_plane_sets:
+            shift = estimate_shift(ref_planes[0], tgt_luma,
+                                   luma_w, luma_h, self.max_shift)
+            luma_shifts.append(shift)
+            wmap = motion_weight_map(
+                tgt_luma, ref_planes[0], luma_w, luma_h, shift,
+                self.motion_threshold)
+            wmap = smooth_weight_map(wmap, luma_w, luma_h, self.mask_radius)
+            luma_weights.append(wmap)
+            weight_sum += sum(wmap)
+            weight_cnt += len(wmap)
+
+        out_planes = []
+        for pi, (plane, (pw, ph)) in enumerate(zip(target_planes, self.dims)):
+            shifts = [
+                (int(round(dx * scale_x[pi])), int(round(dy * scale_y[pi])))
+                for dx, dy in luma_shifts
+            ]
+            refs = [rps[pi] for rps in ref_plane_sets]
+            blended = process_plane(
+                plane, refs, luma_weights, luma_w, luma_h, pw, ph,
+                shifts, bands_per_plane[pi], spatial_bands[pi],
+                self.spatial_radius, is_luma=(pi == 0))
+            out_planes.append(blended)
+        try:
+            enc.stdin.write(join_planes(out_planes, self.work, self.w, self.h))
+        except (BrokenPipeError, OSError) as exc:
+            raise PipelineError(f"编码器异常退出：{exc}") from exc
+        return out_planes[0], weight_sum, weight_cnt
+
+
+def _mad_sum(a, b):
+    """两等长 bytes 平面的绝对差之和（定点分子，调用方自行除以像素数）。"""
+    return sum(abs(x - y) for x, y in zip(a, b))
+
+
+def _rounded(numerator, denominator):
+    """四舍五入整数比；分母为 0 时返回 0。"""
+    if not denominator:
+        return 0
+    return (numerator + denominator // 2) // denominator
