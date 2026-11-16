@@ -29,7 +29,11 @@ from .encoders import (
 from .errors import FFmpegRunError, InputNotFoundError
 from .frames import FrameProcessor
 from .probe import HDRInfo, probe_hdr
-from .tonemap import DEFAULT_TONE_METHOD, DEFAULT_REINHARD_WHITE
+from .tonemap import (
+    DEFAULT_TONE_METHOD,
+    DEFAULT_REINHARD_WHITE,
+    DEFAULT_HABLE_SHARPNESS,
+)
 from .transfer import TRANSFER_PQ, TRANSFER_HLG
 
 __all__ = ["ConversionResult", "convert_hdr_to_sdr", "build_decode_cmd", "build_encode_cmd"]
@@ -168,11 +172,12 @@ def convert_hdr_to_sdr(
     workers: int = 1,
     progress_every: int = 0,
     reinhard_white: float = DEFAULT_REINHARD_WHITE,
+    hable_sharpness: float = DEFAULT_HABLE_SHARPNESS,
 ) -> ConversionResult:
     """执行完整 HDR→SDR 转换。
 
     :param assume: 元数据无法确证类型时的显式兜底（"pq"/"hlg"）。
-    :param tone_method: reinhard / reinhard_classic / bt2390 / clip。
+    :param tone_method: reinhard / reinhard_classic / hable / bt2390 / clip。
     :param codec: 视频编码器，软编 libx264/libx265 或硬编
         h264_nvenc/hevc_nvenc/h264_qsv/hevc_qsv/h264_amf/hevc_amf。
         软/硬编共用同一 Python 引擎产出的原始帧，画面一致、仅末端编码不同。
@@ -182,6 +187,8 @@ def convert_hdr_to_sdr(
     :param progress_every: 每处理 N 帧打印一次进度，0 表示不打印。
     :param reinhard_white: 经典 Reinhard（reinhard_classic）白点，相对
         peak 的倍数；越界钳制并 warning，其它色调方法忽略。
+    :param hable_sharpness: Hable/Filmic（hable）肩部锐度，越界钳制并
+        warning，其它色调方法忽略。
     :raises InputNotFoundError: 输入不存在。
     :raises FFmpegRunError: ffmpeg 解码/编码失败。
     """
@@ -208,6 +215,7 @@ def convert_hdr_to_sdr(
         dst_bits=dst_bits,
         dst_range=dst_range,
         reinhard_white=reinhard_white,
+        hable_sharpness=hable_sharpness,
     )
 
     decode_cmd, raw_fmt, bpp = build_decode_cmd(ffmpeg, src_path, info)

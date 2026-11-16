@@ -1,0 +1,8 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 对比工具与本地验证产物
+build/
+*.egg-info/

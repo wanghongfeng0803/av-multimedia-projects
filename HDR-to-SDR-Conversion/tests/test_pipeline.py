@@ -138,13 +138,84 @@ class TestHLGConversion:
 
 class TestToneMethods:
     @pytest.mark.parametrize(
-        "method", ["reinhard", "reinhard_classic", "bt2390", "clip"]
+        "method", ["reinhard", "reinhard_classic", "hable", "bt2390", "clip"]
     )
     def test_all_methods_produce_valid_output(self, pq_file, work_dir, method):
         out = os.path.join(work_dir, f"tone_{method}.mp4")
         result = convert_hdr_to_sdr(pq_file, out, tone_method=method)
         assert os.path.isfile(out)
         assert result.tone_method == method
+
+    def test_hable_with_sharpness(self, pq_file, work_dir):
+        """Hable + 可调锐度端到端：锐度不同产出都合法可播放、帧数一致。"""
+        out1 = os.path.join(work_dir, "hable_c2.mp4")
+        out2 = os.path.join(work_dir, "hable_c16.mp4")
+        r1 = convert_hdr_to_sdr(
+            pq_file, out1, tone_method="hable", hable_sharpness=2.0
+        )
+        r2 = convert_hdr_to_sdr(
+            pq_file, out2, tone_method="hable", hable_sharpness=16.0
+        )
+        assert r1.tone_method == "hable" and r2.tone_method == "hable"
+        assert r1.frames_processed == r2.frames_processed
+        assert os.path.getsize(out1) > 0 and os.path.getsize(out2) > 0
+
+    def test_hable_sharpness_out_of_range_clamps(self, pq_file, work_dir):
+        """越界锐度：钳制 + warning，但转换仍成功完成（不中断批处理）。"""
+        import warnings
+        out = os.path.join(work_dir, "hable_clamp.mp4")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = convert_hdr_to_sdr(
+                pq_file, out, tone_method="hable", hable_sharpness=99999.0,
+            )
+        assert os.path.isfile(out) and result.tone_method == "hable"
+
+    def test_switching_mapper_keeps_colorspace_bitdepth_metadata(
+        self, pq_file, work_dir
+    ):
+        """硬约束：切换映射器时色彩空间、位深、元数据清理行为完全一致。"""
+        outs = {}
+        for method in ("reinhard", "hable"):
+            path = os.path.join(work_dir, f"switch_{method}.mp4")
+            convert_hdr_to_sdr(
+                pq_file, path, tone_method=method, dst_bits=10,
+            )
+            outs[method] = path
+
+        streams = {m: _video_stream(p) for m, p in outs.items()}
+        for key in ("color_transfer", "color_primaries", "color_space",
+                    "pix_fmt", "bits_per_raw_sample"):
+            assert streams["reinhard"].get(key) == streams["hable"].get(key)
+        # 两者都是干净的 BT.709 SDR，无任何 HDR 传递函数残留
+        for stream in streams.values():
+            assert stream["color_transfer"] == "bt709"
+            assert stream["color_transfer"] not in (
+                "smpte2084", "arib-std-b67"
+            )
+
+    def test_hable_frame_count_matches_reinhard(self, pq_file, work_dir):
+        """同素材同帧号区间：两种映射器处理帧数必须一致（可对比的前提）。"""
+        r_out = os.path.join(work_dir, "cnt_r.mp4")
+        h_out = os.path.join(work_dir, "cnt_h.mp4")
+        r1 = convert_hdr_to_sdr(pq_file, r_out, tone_method="reinhard")
+        r2 = convert_hdr_to_sdr(pq_file, h_out, tone_method="hable")
+        assert r1.frames_processed == r2.frames_processed
+
+    def test_hable_no_clipping_in_output(self, pq_file, work_dir):
+        """不过曝对 hable 同样成立：亮度不整帧钉死在 limited 白电平。"""
+        out = os.path.join(work_dir, "hable_clip.mp4")
+        convert_hdr_to_sdr(pq_file, out, tone_method="hable")
+        proc = subprocess.run(
+            [shutil.which("ffmpeg"), "-v", "error", "-i", out,
+             "-pix_fmt", "yuv420p", "-f", "rawvideo", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        raw = proc.stdout
+        width, height = 160, 120
+        first_y = raw[:width * height]
+        clipped = sum(1 for c in first_y if c >= 235)
+        assert clipped < width * height * 0.95
 
     def test_classic_reinhard_with_white(self, pq_file, work_dir):
         """经典 Reinhard + 可调白点端到端：白点不同产出都合法可播放。"""

@@ -46,6 +46,18 @@ class TestParser:
         assert args.reinhard_white == 2.5
         assert args.codec == "h264_nvenc"
 
+    def test_hable_with_sharpness(self):
+        args = build_parser().parse_args([
+            "in.mkv", "out.mp4", "--tone", "hable", "--sharpness", "12.5",
+        ])
+        assert args.tone == "hable"
+        assert args.hable_sharpness == 12.5
+
+    def test_default_sharpness(self):
+        args = build_parser().parse_args(["in.mkv", "out.mp4"])
+        from hdr_to_sdr.tonemap import DEFAULT_HABLE_SHARPNESS
+        assert args.hable_sharpness == DEFAULT_HABLE_SHARPNESS
+
     def test_all_hardware_codecs_accepted(self):
         for hw in (
             "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf",
@@ -111,6 +123,13 @@ class TestCLIEndToEnd:
             pq_file, out,
             "--tone", "reinhard_classic", "--white", "2.0",
         ])
+        assert rc == 0
+        assert os.path.isfile(out)
+        assert "转换完成" in capsys.readouterr().out
+
+    def test_hable_cli(self, pq_file, work_dir, capsys):
+        out = os.path.join(work_dir, "hable.mp4")
+        rc = main([pq_file, out, "--tone", "hable", "--sharpness", "8.0"])
         assert rc == 0
         assert os.path.isfile(out)
         assert "转换完成" in capsys.readouterr().out

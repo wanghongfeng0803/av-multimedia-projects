@@ -34,7 +34,9 @@ from .colorscience import (
 from .tonemap import (
     DEFAULT_TONE_METHOD,
     DEFAULT_REINHARD_WHITE,
+    DEFAULT_HABLE_SHARPNESS,
     clamp_reinhard_white,
+    clamp_hable_sharpness,
     resolve_tone_method,
     tone_map_pixel,
 )
@@ -69,6 +71,7 @@ class FrameProcessor:
         dst_range: str = RANGE_LIMITED,
         oetf_lut_size: int = DEFAULT_OETF_LUT_SIZE,
         reinhard_white: float = DEFAULT_REINHARD_WHITE,
+        hable_sharpness: float = DEFAULT_HABLE_SHARPNESS,
     ):
         if transfer not in (TRANSFER_PQ, TRANSFER_HLG):
             raise ValueError(f"未知传递函数: {transfer}")
@@ -77,9 +80,10 @@ class FrameProcessor:
         self.pixel_range = pixel_range
         self.is_rgb = is_rgb
         self.tone_method = resolve_tone_method(tone_method)
-        # 白点在构造时钳制一次：逐像素循环里不再触发 warning，
+        # 调谐参数在构造时钳制一次：逐像素循环里不再触发 warning，
         # 也保证进程池 pickle 传递后各 worker 用的是同一个确定值
         self.reinhard_white = clamp_reinhard_white(reinhard_white)
+        self.hable_sharpness = clamp_hable_sharpness(hable_sharpness)
         self.dst_bits = dst_bits
         self.dst_range = dst_range
         self.bytes_per_sample = 4 if is_rgb else 2
@@ -224,7 +228,7 @@ class FrameProcessor:
             r_lin, g_lin, b_lin = self._to_display_linear(rp, gp, bp)
             r_lin, g_lin, b_lin = tone_map_pixel(
                 r_lin, g_lin, b_lin, self.tone_method, self.peak,
-                self.reinhard_white,
+                self.reinhard_white, self.hable_sharpness,
             )
             r709, g709, b709 = gamut_map_pixel(r_lin, g_lin, b_lin)
             vr = lerp_lut(oetf, r709)
@@ -294,7 +298,7 @@ class FrameProcessor:
             r_lin, g_lin, b_lin = self._to_display_linear(rp, gp, bp)
             r_lin, g_lin, b_lin = tone_map_pixel(
                 r_lin, g_lin, b_lin, self.tone_method, self.peak,
-                self.reinhard_white,
+                self.reinhard_white, self.hable_sharpness,
             )
             r709, g709, b709 = gamut_map_pixel(r_lin, g_lin, b_lin)
             nr, ng, nb = self._neutral_guard(

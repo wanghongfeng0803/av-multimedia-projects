@@ -169,6 +169,64 @@ class TestReinhardClassicEngine:
             assert all(16 <= c <= 240 for c in v)
 
 
+class TestHableEngine:
+    def _proc(self, **kw):
+        return FrameProcessor(
+            TRANSFER_PQ, 10, RANGE_LIMITED, False,
+            tone_method="hable", **kw
+        )
+
+    def test_sharpness_clamped_at_construction(self):
+        # 越界锐度在构造期即被钳制，处理器上持有确定的合法值
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            proc = self._proc(hable_sharpness=-9.0)
+        from hdr_to_sdr.tonemap import HABLE_SHARPNESS_MIN
+        assert proc.hable_sharpness == HABLE_SHARPNESS_MIN
+
+    def test_different_sharpness_changes_output(self):
+        frame = _make_yuv444p16_frame(8, 4, 900, 542, 542)
+        out_lo = self._proc(hable_sharpness=1.0).process_frame(frame, 8, 4)
+        out_hi = self._proc(hable_sharpness=32.0).process_frame(frame, 8, 4)
+        y_lo, _, _ = _parse_yuv444p16(out_lo, 8, 4)
+        y_hi, _, _ = _parse_yuv444p16(out_hi, 8, 4)
+        # 锐度大肩部陡、压缩轻 → Y 码值更高
+        assert sum(y_hi) >= sum(y_lo)
+        assert out_lo != out_hi
+
+    def test_deterministic_two_runs(self):
+        proc = self._proc(hable_sharpness=8.0)
+        frame = _make_yuv444p16_frame(16, 8, 700, 400, 600)
+        assert proc.process_frame(frame, 16, 8) == proc.process_frame(frame, 16, 8)
+
+    def test_band_parallel_matches_serial_hable(self):
+        proc = self._proc(hable_sharpness=8.0)
+        frame = _make_yuv444p16_frame(32, 16, 700, 400, 600)
+        serial = proc.process_frame(frame, 32, 16)
+        parallel = proc.process_bands(frame, 32, 16, workers=2, band_height=8)
+        assert serial == parallel
+
+    def test_output_in_limited_range(self):
+        proc = self._proc()
+        for y_code in (64, 512, 940, 1023):
+            frame = _make_yuv444p16_frame(4, 4, y_code, 542, 542)
+            out = proc.process_frame(frame, 4, 4)
+            y, u, v = _parse_yuv444p16(out, 4, 4)
+            assert all(16 <= c <= 235 for c in y)
+            assert all(16 <= c <= 240 for c in u)
+            assert all(16 <= c <= 240 for c in v)
+
+    def test_hable_and_reinhard_identical_in_dark_region(self):
+        # 膝下恒等是两曲线共享的：低码值灰场输出逐字节相同
+        frame = _make_yuv444p16_frame(8, 4, 256, 542, 542)
+        h = self._proc().process_frame(frame, 8, 4)
+        r = FrameProcessor(
+            TRANSFER_PQ, 10, RANGE_LIMITED, False, tone_method="reinhard"
+        ).process_frame(frame, 8, 4)
+        assert h == r
+
+
 class TestRGBPath:
     def _make_gbrpf32_frame(self, width, height, r, g, b):
         plane = width * height
