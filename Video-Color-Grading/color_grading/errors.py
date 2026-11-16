@@ -51,3 +51,36 @@ class StreamTruncatedError(ColorGradingError):
     """解码出的裸视频流在帧中途结束（通常意味着解码器异常退出）。"""
 
     exit_code = 7
+
+
+class LUTParseError(ColorGradingError):
+    """.cube 文件无法解析（格式损坏、关键字缺失/重复、数据不足等）。
+
+    所有错误都携带可定位信息：``file_path`` 指明是哪个文件，
+    ``line_number`` 指明触发问题的行（``None`` 表示问题属于整个
+    文件而非某一行，如完全没有 ``LUT_3D_SIZE``）。错误消息本身
+    已包含行号，CLI 可直接展示。
+    """
+
+    exit_code = 8
+
+    def __init__(self, message: str, file_path: str = "", line_number: int | None = None):
+        located = message
+        if file_path:
+            located = f"{file_path}: {located}"
+        if line_number is not None:
+            located = f"第 {line_number} 行: {located}"
+        super().__init__(located)
+        self.file_path = file_path
+        self.line_number = line_number
+
+
+class LUTDomainError(ColorGradingError):
+    """.cube 的域（DOMAIN_*）或尺寸与本工具约定不匹配，拒绝硬套。
+
+    本工具只接受未显式声明非默认域、即归一化 [0, 1] 的 3D LUT；
+    任何偏移 / 缩放 / 负数域都无法在 rgb24 字节域上直接套用，
+    一律报错而不是静默钳制或重映射。
+    """
+
+    exit_code = 9

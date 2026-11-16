@@ -1,18 +1,20 @@
 # Video-Color-Grading
 
-视频亮度 / 对比度 / 色相 / 饱和度调整工具。纯 Python 标准库实现，ffmpeg / ffprobe 通过子进程调用。
+视频亮度 / 对比度 / 色相 / 饱和度调整工具，支持把 **3D LUT（.cube）作为独立调色节点**接入链路。纯 Python 标准库实现，ffmpeg / ffprobe 通过子进程调用。
 
 ## 功能
 
 - 按帧调整四个通道：
   - 亮度（[-100, 100]）、对比度（[-100, 100]）；
   - **色相**旋转（[-180, 180] 度，逆时针为正）、**饱和度**（[-100, 100]，-100 完全去色、+100 翻倍）。
+- **3D LUT 独立节点**：解析 Adobe ``.cube``（三线性插值），可按节点位置与其它步骤串联，强度 0–1 连续混合。
 - **保留原音轨**（`-c:a copy` 直通，不重编码）。
 - 参数超范围自动**钳制到边界并提示**（`UserWarning` + 结果消息），不中断批处理。
 - 亮度/对比度用 256 字节**映射表，只构建一次**，全部帧 / 分块 / worker 进程复用；
-  色相/饱和度为跨通道操作，按像素在 RGB↔HSV 间换算。
+  色相/饱和度为跨通道操作，按像素在 RGB↔HSV 间换算；3D LUT 只解析一次、随节点链分发。
 - 帧内行带**分块 + 多进程并行**映射；在途块数有界，**内存占用不随分辨率 / 时长增长**。
-- 无参数调用（四项均为 0）为逐字节恒等映射，是固定的兼容基线。
+- 无参数调用（四项均为 0、不挂 3D LUT）为逐字节恒等映射，是固定的兼容基线。
+- 解析 / 域 / 尺寸失败时**保留原图、不产出半成品**，错误带文件名与行号可定位；同一输入两次输出逐字节一致。
 
 ## 通道顺序（全局统一，不得一处一套）
 
@@ -37,13 +39,61 @@ RGB 后再进入本管道。该约定由 `tests/test_chunks.py::test_rgb_channel
 `tests/test_colorspace.py::test_combined_order_matches_hue_then_saturation_reference`
 和 `tests/test_chunks.py::test_lut_then_hsv_fixed_order_is_byte_exact` 锁定。
 
+## 3D LUT 节点（.cube，三线性插值）
+
+3D LUT 被建模为调色链路里的一个**独立节点**（`color_grading.lut3d` +
+`color_grading.nodes.LUT3DNode`），与亮度/对比度、色相/饱和度节点地位
+相同，可以按显式顺序串联。
+
+### .cube 解析：宽容噪声，严格拒绝语义错误
+
+- **容错**：`#` 注释（含行内）、空行、CRLF/LF、多余空白、关键字大小写、
+  带不带引号的 `TITLE`、整数或浮点数据。
+- **直接报错（不硬套）**：
+  - 尺寸问题 → `LUTParseError`：缺/重复 `LUT_3D_SIZE`、N 超出 [2,256]、
+    数据点数与 N³ 不符、数据行出现在尺寸声明之前、列数不为 3、
+    token 不是数值、出现 NaN/Inf、`LUT_1D_SIZE`（1D LUT 不伪装成 3D）。
+  - 域问题 → `LUTDomainError`：只接受未声明域或显式单位域
+    （`DOMAIN_MIN 0 0 0`、`DOMAIN_MAX 1 1 1`）。任何带偏移/缩放/负数的
+    非单位域无法在 rgb24 字节域无损套用，一律拒绝而非静默重映射。
+  - 所有错误携带 `file_path` 与 `line_number`（整文件级问题行号为
+    `None`），CLI 直接打印「文件名: 第 N 行: …」，可定位。
+- 数据展平顺序按 Adobe 约定 **R 增长最快、G 次之、B 最慢**。
+
+### 强度 0–1：两端边界精确
+
+强度 `strength` ∈ [0,1] 在**输出字节空间**对原色与全量 LUT 结果做线性混合：
+`out = round(orig + (lut_out - orig) * strength)`。
+
+- `strength == 0`：节点恒等，输出与输入**逐字节相同**（跳过浮点往返）；
+- `strength == 1`：输出与全量 LUT**逐字节相同**；
+- 超范围自动钳制到 [0,1] 并提示（与其它参数同一策略）。
+
+### 节点顺序：显式、可预期
+
+- CLI / `adjust()` 用 `--lut3d-position` / `lut3d_position` 选择
+  `first`（在亮度/对比度/色相/饱和度之前）或 `last`（默认，在其后）。
+- 需要更自由的组合时用节点化入口 `adjust_nodes(input, output, nodes)`，
+  `nodes` 是有序列表，**列表顺序就是像素处理顺序**；同一节点可重复出现，
+  调换位置即改变函数复合顺序，结果确定且可重复（由
+  `tests/test_nodes.py` 锁定「换位结果不同、各自可重复」）。
+
+### 失败原子性与确定性
+
+- 解析、域校验、强度钳制全部在启动 ffmpeg **之前**完成；这些环节失败时
+  根本不会创建输出文件，原图不动。
+- 像素管道 / ffmpeg 阶段失败时，本次运行新建的输出文件会被删除，预先
+  存在的输出绝不改动（`tests/test_lut3d_pipeline.py` 覆盖两条路径）。
+- 纯标准库、固定运算次序，同一输入 + 同一 LUT + 同一强度，任意进程 /
+  任意次数输出逐字节一致。
+
 ## 用法
 
 ```bash
 python grade.py input.mp4 -o output.mp4 -b 20 -c 10 -H 45 -s -20
-# 或
+# 或挂一张 3D LUT（强度 0.6，置于链路最前）
 python -m color_grading input.mp4 -o output.mp4 \
-    --brightness 20 --contrast 10 --hue 45 --saturation -20
+    --lut3d film.cube --lut3d-strength 0.6 --lut3d-position first
 ```
 
 | 参数 | 短选项 | 范围 | 默认 | 含义 |
@@ -52,6 +102,9 @@ python -m color_grading input.mp4 -o output.mp4 \
 | `--contrast` | `-c` | [-100, 100] | 0 | 以中灰为支点的对比度 |
 | `--hue` | `-H` | [-180, 180] | 0 | 色相旋转角（度），逆时针为正 |
 | `--saturation` | `-s` | [-100, 100] | 0 | 饱和度缩放百分比 |
+| `--lut3d` | — | .cube 路径 | 无 | 3D LUT 文件，不给则不启用该节点 |
+| `--lut3d-strength` | — | [0, 1] | 1 | 0 精确原图、1 全量 LUT，超范围钳制 |
+| `--lut3d-position` | — | first / last | last | 3D LUT 节点在链路中的位置 |
 
 其它参数：`--workers N`（并行进程数）、`--chunk-rows N`（分块行数）、
 `--crf` / `--preset`（x264 编码参数）、`--overwrite`（允许覆盖输出）。
@@ -59,11 +112,24 @@ python -m color_grading input.mp4 -o output.mp4 \
 作为库使用：
 
 ```python
-from color_grading import adjust
+from color_grading import adjust, adjust_nodes, load_cube
+from color_grading import BrightnessContrastNode, HueSaturationNode, LUT3DNode
 
+# 简单用法：四参数 + 一张 3D LUT
 result = adjust("in.mp4", "out.mp4",
-                brightness=20, contrast=10, hue=45, saturation=-20)
-print(result.frames, result.messages)  # messages 含钳制等提示
+                brightness=20, contrast=10, hue=45, saturation=-20,
+                lut3d_path="film.cube", lut3d_strength=0.7,
+                lut3d_position="last")
+print(result.frames, result.lut3d_path, result.lut3d_strength)
+
+# 节点化用法：顺序完全由列表控制（这里 LUT 在最前，再接亮度/色相）
+cube = load_cube("film.cube")
+chain = [
+    LUT3DNode(cube, 0.7),
+    BrightnessContrastNode(),
+    HueSaturationNode(hue=30, saturation=-10),
+]
+adjust_nodes("in.mp4", "out.mp4", chain)
 ```
 
 ## 色相方向如何核对（不靠肉眼）
@@ -80,8 +146,10 @@ print(result.frames, result.messages)  # messages 含钳制等提示
 ## 设计说明
 
 ```
-输入 ──ffmpeg 解码──> rgb24 裸流(RGB) ──分块并行──> rgb24 裸流(RGB) ──ffmpeg 编码──> 输出
-                              │  每块内：① 亮度/对比度 LUT ② 色相 ③ 饱和度
+输入 ──ffmpeg 解码──> rgb24 裸流(RGB) ──分块并行节点链──> rgb24 裸流(RGB) ──ffmpeg 编码──> 输出
+                              │  每块内按节点顺序，例如：
+                              │    ① 亮度/对比度 1D LUT ② 色相 ③ 饱和度 ④ 3D LUT(strength)
+                              │  （3D LUT 也可经 position=first 置于最前）
   └────────────────── 音轨 -c:a copy 原样直通 ───────────────────────────────┘
 ```
 
@@ -102,9 +170,15 @@ print(result.frames, result.messages)  # messages 含钳制等提示
 ## 兼容性
 
 - 旧的 `adjust(...)` / `build_lut(...)` / `map_stream(...)` 调用签名保持
-  可用：新参数 `hue`、`saturation` 全部带默认值 0（仅在 `adjust` /
-  `map_stream` 以关键字传入）；不传时走与旧版完全相同的恒等 / LUT 路径，
-  无参数调用逐字节结果不变（由字节级回归测试锁定）。
+  可用：新参数 `hue`、`saturation` 以及 3D LUT 的 `lut3d_*` 全部带默认值
+  （`lut3d_path=None` 即不启用）；不传时走与旧版完全相同的恒等 / LUT 路径，
+  无参数调用逐字节结果不变（由字节级回归测试锁定，原 79 个测试无一修改）。
+- `map_stream` 旧的 `lut` / `hue` / `saturation` 三参数保留，内部转成等价
+  节点链；新的 `nodes` 节点链参数与旧三参数互斥，混用直接 `ValueError`，
+  避免「哪套顺序生效」的歧义。
+- 新增异常 `LUTParseError`（退出码 8）、`LUTDomainError`（退出码 9），
+  均派生自统一基类 `ColorGradingError`，旧的 `except ColorGradingError`
+  捕获逻辑不受影响。
 
 ## 测试
 

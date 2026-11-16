@@ -9,13 +9,15 @@ from .chunks import DEFAULT_CHUNK_ROWS
 from .colorspace import HUE_MAX, HUE_MIN, SATURATION_MAX, SATURATION_MIN
 from .errors import ColorGradingError
 from .lut import BRIGHTNESS_MAX, BRIGHTNESS_MIN, CONTRAST_MAX, CONTRAST_MIN
-from .pipeline import adjust
+from .lut3d import STRENGTH_MAX, STRENGTH_MIN
+from .pipeline import LUT3D_POSITIONS, adjust
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="color_grading",
-        description="视频亮度/对比度/色相/饱和度调整：按帧处理、保留音轨、分块并行。",
+        description="视频亮度/对比度/色相/饱和度调整 + 可选 3D LUT 节点："
+                    "按帧处理、保留音轨、分块并行。",
     )
     parser.add_argument("input", help="输入视频文件")
     parser.add_argument("-o", "--output", required=True, help="输出视频文件")
@@ -41,6 +43,22 @@ def build_parser() -> argparse.ArgumentParser:
             "+100 翻倍，超范围自动钳制，默认 0"
         ),
     )
+    parser.add_argument(
+        "--lut3d", dest="lut3d_path", default=None,
+        help="3D LUT 的 .cube 文件路径；不给则不启用 3D LUT 节点",
+    )
+    parser.add_argument(
+        "--lut3d-strength", dest="lut3d_strength", type=float, default=1.0,
+        help=(
+            f"3D LUT 强度 [{STRENGTH_MIN:g}, {STRENGTH_MAX:g}]，"
+            "0 精确等于原图、1 为全量 LUT，超范围自动钳制，默认 1"
+        ),
+    )
+    parser.add_argument(
+        "--lut3d-position", dest="lut3d_position", choices=LUT3D_POSITIONS,
+        default="last",
+        help="3D LUT 节点插入位置：first（最前）或 last（最后，默认）",
+    )
     parser.add_argument("--workers", type=int, default=None, help="并行进程数（默认 CPU 核数）")
     parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
                         help=f"分块行数（默认 {DEFAULT_CHUNK_ROWS}）")
@@ -60,6 +78,9 @@ def main(argv: list[str] | None = None) -> int:
             contrast=args.contrast,
             hue=args.hue,
             saturation=args.saturation,
+            lut3d_path=args.lut3d_path,
+            lut3d_strength=args.lut3d_strength,
+            lut3d_position=args.lut3d_position,
             workers=args.workers,
             chunk_rows=args.chunk_rows,
             crf=args.crf,
@@ -67,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
         )
     except ColorGradingError as exc:
+        # LUTParseError 的消息已含「文件名: 第 N 行: …」，可直接定位。
         print(f"错误: {exc}", file=sys.stderr)
         stderr = getattr(exc, "stderr", "")
         if stderr:
@@ -75,10 +97,16 @@ def main(argv: list[str] | None = None) -> int:
 
     for msg in result.messages:
         print(f"提示: {msg}", file=sys.stderr)
+    lut3d_text = ""
+    if result.lut3d_path is not None:
+        lut3d_text = (
+            f" 3DLUT[{result.lut3d_position}] 强度 {result.lut3d_strength:g}"
+        )
     print(
         f"完成: {result.frames} 帧, {result.width}x{result.height}@{result.fps:g}, "
         f"亮度 {result.brightness:g} 对比度 {result.contrast:g} "
-        f"色相 {result.hue:g} 饱和度 {result.saturation:g}, "
+        f"色相 {result.hue:g} 饱和度 {result.saturation:g},"
+        f"{lut3d_text} "
         f"{'含音轨' if result.has_audio else '无音轨'}, "
         f"耗时 {result.elapsed_seconds:.1f}s -> {result.output_path}"
     )
