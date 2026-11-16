@@ -40,9 +40,17 @@ from pathlib import Path
 from .audio import S16_CHANNELS, assemble_audio, choose_sample_rate
 from .blend import blend_rgb24_frame
 from .errors import PipelineError
-from .plan import KIND_HEAD, KIND_OVERLAP, TransitionPlan, build_plan, frame_jobs
+from .plan import (
+    KIND_HEAD,
+    KIND_OVERLAP,
+    TRANSITION_SLIDE,
+    TransitionPlan,
+    build_plan,
+    frame_jobs,
+)
 from .probe import ClipMeta, ffmpeg_bin, probe_clip
 from .reader import FrameReader, load_pcm_bytes, read_pcm_track
+from .slide import composite_slide_frame
 
 __all__ = ["TransitionResult", "cross_fade", "FrameWriter"]
 
@@ -69,12 +77,22 @@ class TransitionResult:
     sample_rate: int
     had_audio: tuple[bool, bool]
     encoder: str
+    transition: str = "fade"
+    direction: str = "right"
+    easing: str = "linear"
+
+    @property
+    def transition_label(self) -> str:
+        """转场中文标签（淡化 / 滑动-方向 / 曲线），供账目打印。"""
+        if self.transition == TRANSITION_SLIDE:
+            return f"滑动({self.direction},{self.easing})"
+        return "交叉淡化"
 
     def describe_segments(self) -> str:
         """生成可人工核对的逐段账目字符串。"""
         return (
             f"head={self.head_frames} 帧(纯A) + "
-            f"overlap={self.overlap_frames} 帧(交叉淡化) + "
+            f"overlap={self.overlap_frames} 帧({self.transition_label}) + "
             f"tail={self.tail_frames} 帧(纯B) = {self.frames_written} 帧；"
             f"时长 {self.duration_seconds:.3f}s"
         )
@@ -197,19 +215,24 @@ def cross_fade(
     *,
     overlap_seconds: float | None = None,
     overlap_frames: int | None = None,
+    transition: str = "fade",
+    direction: str = "right",
+    easing: str = "linear",
     crf: int = 23,
     preset: str = "medium",
     overwrite: bool = False,
     progress_callback=None,
 ) -> TransitionResult:
-    """在两段素材之间做交叉淡化转场，返回逐段可核对的结果摘要。
+    """在两段素材之间做转场，返回逐段可核对的结果摘要。
 
-    重叠时长可配（秒或帧二选一），成片总帧数恒为
-    ``Na + Nb - No``——重叠区之外一帧不丢。视频帧与音频采样
-    使用同一套淡化权重，音视频淡化严格同帧。
+    默认 ``transition="fade"`` 为历史交叉淡化，行为与输出逐字节不变；
+    ``transition="slide"`` 时按 ``direction``（right/left/down/up）做
+    四方向滑动、``easing`` 选择速度曲线。两种转场共用同一份帧域账本
+    （成片总帧数恒为 ``Na + Nb - No``，重叠区之外一帧不丢）、同一套
+    帧混合器与同一条音频进度曲线。
 
     :raises ProbeError: 素材无法探测；
-    :raises PlanError: 帧率/尺寸不一致或重叠参数非法；
+    :raises PlanError: 帧率/尺寸不一致或转场/重叠参数非法；
     :raises PipelineError: 解码截断、帧数核对不符或编码失败。
     """
     if not os.path.isfile(path_a):
@@ -225,6 +248,9 @@ def cross_fade(
         meta_a, meta_b,
         overlap_seconds=overlap_seconds,
         overlap_frames=overlap_frames,
+        transition=transition,
+        direction=direction,
+        easing=easing,
     )
     jobs = frame_jobs(plan)
     if len(jobs) != plan.output_frames:
@@ -272,10 +298,19 @@ def cross_fade(
                         frame_b = _next_frame(queue_b, "B")
                         if frame_a is None or frame_b is None:
                             raise PipelineError("素材在重叠区提前耗尽")
-                        blend_rgb24_frame(
-                            blend_buf, frame_a, frame_b,
-                            job.weight_b_num, job.weight_b_den,
-                        )
+                        if plan.is_slide:
+                            # 滑动：按帧任务里的整数位移做区域合成，
+                            # 条带内部仍走 blend_rgb24_frame（端点权重）
+                            composite_slide_frame(
+                                blend_buf, frame_a, frame_b,
+                                plan.width, plan.height,
+                                plan.direction, job.shift,
+                            )
+                        else:
+                            blend_rgb24_frame(
+                                blend_buf, frame_a, frame_b,
+                                job.weight_b_num, job.weight_b_den,
+                            )
                         writer.write_frame(blend_buf)
                     else:  # KIND_TAIL
                         frame = _next_frame(queue_b, "B")
@@ -342,6 +377,9 @@ def cross_fade(
         sample_rate=sample_rate,
         had_audio=(meta_a.has_audio, meta_b.has_audio),
         encoder="libx264+aac",
+        transition=plan.transition,
+        direction=plan.direction,
+        easing=plan.easing,
     )
 
 

@@ -32,6 +32,39 @@ class TestParser:
         with pytest.raises(SystemExit):
             build_parser().parse_args(["a.mp4", "b.mp4", "-o", "o.mp4"])
 
+    def test_transition_defaults_to_fade(self):
+        args = build_parser().parse_args(
+            ["a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5"]
+        )
+        assert args.transition == "fade"
+        assert args.direction == "right"
+        assert args.easing == "linear"
+
+    def test_slide_args_parsed(self):
+        args = build_parser().parse_args([
+            "a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5",
+            "--transition", "slide",
+            "--direction", "up",
+            "--easing", "ease_in_out",
+        ])
+        assert args.transition == "slide"
+        assert args.direction == "up"
+        assert args.easing == "ease_in_out"
+
+    def test_bad_direction_rejected_by_argparse(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([
+                "a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5",
+                "--transition", "slide", "--direction", "north",
+            ])
+
+    def test_bad_easing_rejected_by_argparse(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([
+                "a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5",
+                "--easing", "bounce",
+            ])
+
 
 class TestMainErrors:
     def test_missing_input_returns_code_2(self, tmp_path):

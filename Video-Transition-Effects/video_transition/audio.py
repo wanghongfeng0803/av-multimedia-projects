@@ -18,17 +18,18 @@ rawvideo 帧域没有时间戳，音频 PCM 同样不带时间戳，对齐只能
 淡化同步
 ========
 
-重叠区第 k 帧的音频增益与视频像素增益**完全相同**（``w_b = k/(No-1)``，
-单帧重叠取 1/2），且按帧整块施加：画面淡到哪一帧，声音就淡到哪一帧，
-从机制上排除「画面淡了声音没淡」。无音轨的素材用同长度静音 PCM 占位，
-两条时间轴的形状始终一致。
+重叠区第 k 帧的音频增益与视频推进**完全同源**：淡化时为线性权重
+``w_b = k/(No-1)``（单帧重叠取 1/2），滑动时为速度曲线的有理数
+进度。增益按帧整块施加：画面推进到哪一帧，声音就跟到哪一帧，
+从机制上排除「画面动了声音没动」。无音轨的素材用同长度静音 PCM
+占位，两条时间轴的形状始终一致。
 """
 
 from __future__ import annotations
 
 from .blend import blend_s16_samples, div_round_half_away
 from .errors import PlanError
-from .plan import TransitionPlan, fade_weight_b
+from .plan import TransitionPlan, fade_weight_b, transition_gain_fraction
 
 __all__ = [
     "S16_CHANNELS",
@@ -147,7 +148,7 @@ def assemble_audio(
         block = _take_frame(pcm_a, bounds_a[f], s1 - s0)
         out[s0 * _FRAME_BYTES:s1 * _FRAME_BYTES] = block
 
-    # 2) overlap：第 k 帧混合 A[na-No+k] 与 B[k]，增益与视频逐帧相同
+    # 2) overlap：第 k 帧混合 A[na-No+k] 与 B[k]，增益与视频推进同源
     no = plan.overlap_frames
     for k in range(no):
         f_out = overlap_seg.out_start + k
@@ -157,7 +158,9 @@ def assemble_audio(
         idx_b = overlap_seg.b_start + k
         block_a = _take_frame(pcm_a, bounds_a[idx_a], span)
         block_b = _take_frame(pcm_b, bounds_b[idx_b], span)
-        wnum, wden = overlap_weight_fraction(k, no)
+        wnum, wden = transition_gain_fraction(
+            k, no, plan.transition, plan.easing
+        )
         # 注意：bytearray 切片是副本，必须混合后再切片回写，
         # 不能直接对切片就地混合（改动会随副本一起丢弃）
         dst = bytearray(span * _FRAME_BYTES)

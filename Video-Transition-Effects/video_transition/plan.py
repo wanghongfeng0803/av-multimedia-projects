@@ -35,8 +35,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .easing import EASINGS, EASING_LINEAR
 from .errors import PlanError
 from .probe import ClipMeta
+from .slide import DIRECTIONS, DIRECTION_RIGHT
 
 __all__ = [
     "Segment",
@@ -45,15 +47,27 @@ __all__ = [
     "build_plan",
     "fade_weight_b",
     "frame_jobs",
+    "transition_gain_fraction",
     "KIND_HEAD",
     "KIND_OVERLAP",
     "KIND_TAIL",
+    "TRANSITION_FADE",
+    "TRANSITION_SLIDE",
+    "TRANSITIONS",
 ]
 
 #: 成片三段的类型标签
 KIND_HEAD = "head"
 KIND_OVERLAP = "overlap"
 KIND_TAIL = "tail"
+
+#: 交叉淡化（默认，旧行为逐字节不变）
+TRANSITION_FADE = "fade"
+#: 四方向滑动
+TRANSITION_SLIDE = "slide"
+
+#: 全部合法转场类型
+TRANSITIONS = (TRANSITION_FADE, TRANSITION_SLIDE)
 
 
 @dataclass(frozen=True)
@@ -86,8 +100,12 @@ class FrameJob:
     :param kind: 所在区间类型；
     :param index_a/index_b: 分别要从 A/B 读取器取的帧号，
         纯 A 段 ``index_b`` 为 -1，纯 B 段 ``index_a`` 为 -1；
-    :param weight_b_num/weight_b_den: B 权重的有理数分子/分母，
-        纯 A 段为 (0,1)，纯 B 段为 (1,1)，混合段为 (k, No-1)。
+    :param weight_b_num/weight_b_den: B 音频增益的有理数分子/分母，
+        纯 A 段为 (0,1)，纯 B 段为 (1,1)。淡化时它同时是像素混合
+        权重；滑动时像素按 :attr:`shift` 做区域拷贝，本字段仍驱动
+        音轨增益（与画面推进共用同一条进度曲线）；
+    :param transition: 该帧所属转场类型（fade/slide）；
+    :param shift: 滑动转场沿运动轴的整数像素位移，非滑动帧为 0。
     """
 
     out_index: int
@@ -96,6 +114,8 @@ class FrameJob:
     index_b: int
     weight_b_num: int
     weight_b_den: int
+    transition: str = TRANSITION_FADE
+    shift: int = 0
 
     @property
     def is_overlap(self) -> bool:
@@ -105,12 +125,15 @@ class FrameJob:
 
 @dataclass(frozen=True)
 class TransitionPlan:
-    """两段素材交叉淡化的完整帧映射表。"""
+    """两段素材转场的完整帧映射表（淡化与滑动共用同一份帧域账本）。"""
 
     clip_a: ClipMeta
     clip_b: ClipMeta
     overlap_frames: int
     segments: tuple[Segment, ...]
+    transition: str = TRANSITION_FADE
+    direction: str = DIRECTION_RIGHT
+    easing: str = EASING_LINEAR
 
     @property
     def fps_num(self) -> int:
@@ -131,6 +154,11 @@ class TransitionPlan:
     def height(self) -> int:
         """成片高度。"""
         return self.clip_a.height
+
+    @property
+    def is_slide(self) -> bool:
+        """是否为滑动转场（否则为交叉淡化）。"""
+        return self.transition == TRANSITION_SLIDE
 
     @property
     def output_frames(self) -> int:
@@ -158,10 +186,11 @@ class TransitionPlan:
         return self.segments[2]
 
     def weight_b_at(self, out_index: int) -> float:
-        """成片第 ``out_index`` 帧上 B 素材的淡化权重。
+        """成片第 ``out_index`` 帧上 B 素材的增益（音频语义）。
 
-        非重叠段恒为 0（纯 A）或 1（纯 B）；重叠段按帧线性插值。
-        传入越界帧号抛 :class:`PlanError`。
+        非重叠段恒为 0（纯 A）或 1（纯 B）；淡化重叠段按帧线性
+        插值，滑动重叠段按所选速度曲线求值。传入越界帧号抛
+        :class:`PlanError`。
         """
         if not 0 <= out_index < self.output_frames:
             raise PlanError(f"成片帧号越界: {out_index} / {self.output_frames}")
@@ -171,7 +200,10 @@ class TransitionPlan:
         if out_index >= ov.out_end:
             return 1.0
         k = out_index - ov.out_start
-        return fade_weight_b(k, self.overlap_frames)
+        num, den = transition_gain_fraction(
+            k, self.overlap_frames, self.transition, self.easing
+        )
+        return num / den
 
 
 def fade_weight_b(k: int, overlap_frames: int) -> float:
@@ -189,11 +221,40 @@ def fade_weight_b(k: int, overlap_frames: int) -> float:
     return k / (overlap_frames - 1)
 
 
+def transition_gain_fraction(
+    k: int,
+    overlap_frames: int,
+    transition: str = TRANSITION_FADE,
+    easing: str = EASING_LINEAR,
+) -> tuple[int, int]:
+    """重叠区第 k 帧 B 增益的 ``(分子, 分母)`` 有理数（音频与进度同源）。
+
+    * 淡化（``fade``）：保持旧语义 ``k/(No-1)``，单帧取 1/2，
+      与历史输出逐字节一致；
+    * 滑动（``slide``）：取速度曲线的有理数进度（见
+      :func:`video_transition.easing.eased_fraction`），画面推进
+      到哪、声音增益就跟到哪。
+    """
+    # 复用淡化版的边界校验
+    fade_weight_b(k, overlap_frames)
+    if transition == TRANSITION_FADE:
+        if overlap_frames == 1:
+            return 1, 2
+        return k, overlap_frames - 1
+    if transition == TRANSITION_SLIDE:
+        from .easing import eased_fraction
+
+        return eased_fraction(k, overlap_frames, easing)
+    raise PlanError(f"未知转场类型: {transition!r}，可选 {TRANSITIONS}")
+
+
 def frame_jobs(plan: TransitionPlan) -> list[FrameJob]:
     """按规划表展开成片每一帧的 :class:`FrameJob` 序列。
 
     纯逻辑函数，不触碰 ffmpeg；管道侧与测试侧共用同一份调度结果，
     保证「测试里核对的取帧指令」就是「实际执行的取帧指令」。
+    淡化与滑动的取帧坐标完全相同，差异只在重叠帧附带的转场类型
+    与滑动位移（位移由速度曲线在帧域内定值）。
     """
     jobs: list[FrameJob] = []
     head, overlap_seg, tail = plan.segments
@@ -203,19 +264,27 @@ def frame_jobs(plan: TransitionPlan) -> list[FrameJob]:
     for f in range(head.out_start, head.out_end):
         jobs.append(FrameJob(f, KIND_HEAD, f, -1, 0, 1))
 
-    # overlap：成片帧对应 A[na-no+k] 与 B[k]，权重为精确分数
+    # overlap：成片帧对应 A[na-no+k] 与 B[k]，增益为精确分数
     for k in range(no):
         f = overlap_seg.out_start + k
-        if no == 1:
-            wnum, wden = 1, 2
-        else:
-            wnum, wden = k, no - 1
+        wnum, wden = transition_gain_fraction(
+            k, no, plan.transition, plan.easing
+        )
+        shift = 0
+        if plan.is_slide:
+            from .easing import eased_shift
+            from .slide import HORIZONTAL_DIRECTIONS
+
+            axis = plan.width if plan.direction in HORIZONTAL_DIRECTIONS else plan.height
+            shift = eased_shift(k, no, axis, plan.easing)
         jobs.append(
             FrameJob(
                 f, KIND_OVERLAP,
                 overlap_seg.a_start + k,
                 overlap_seg.b_start + k,
                 wnum, wden,
+                transition=plan.transition,
+                shift=shift,
             )
         )
 
@@ -233,6 +302,9 @@ def build_plan(
     *,
     overlap_seconds: float | None = None,
     overlap_frames: int | None = None,
+    transition: str = TRANSITION_FADE,
+    direction: str = DIRECTION_RIGHT,
+    easing: str = EASING_LINEAR,
 ) -> TransitionPlan:
     """根据两段素材的探针结果与重叠配置构造 :class:`TransitionPlan`。
 
@@ -244,6 +316,14 @@ def build_plan(
 
     两个参数都不给时抛 :class:`PlanError`，避免「零重叠」悄悄退化成
     硬切而调用方毫无感知。
+
+    :param transition: ``fade``（交叉淡化，默认，旧行为不变）或
+        ``slide``（四方向滑动）；
+    :param direction: 滑动方向，仅 ``slide`` 时生效，取
+        :data:`video_transition.slide.DIRECTIONS` 之一；
+    :param easing: 速度曲线，取
+        :data:`video_transition.easing.EASINGS` 之一；淡化默认线性
+        即历史等间隔权重。
     """
     # 1) 两段素材必须同帧率、同尺寸：帧读取器吐出的是固定尺寸裸流，
     #    淡化是逐像素整数运算，不做隐式缩放/重采样以免账本失真。
@@ -257,6 +337,14 @@ def build_plan(
             f"两段素材尺寸不一致: {clip_a.width}x{clip_a.height} vs "
             f"{clip_b.width}x{clip_b.height}；请先统一分辨率"
         )
+
+    # 2) 转场参数白名单校验（非法值在规划阶段就失败，不进入管道）
+    if transition not in TRANSITIONS:
+        raise PlanError(f"未知转场类型: {transition!r}，可选 {TRANSITIONS}")
+    if direction not in DIRECTIONS:
+        raise PlanError(f"未知滑动方向: {direction!r}，可选 {DIRECTIONS}")
+    if easing not in EASINGS:
+        raise PlanError(f"未知速度曲线: {easing!r}，可选 {EASINGS}")
 
     # 2) 解析重叠帧数（秒数配置换算到帧域，之后全部按整数帧说话）
     if overlap_frames is not None and overlap_seconds is not None:
@@ -306,4 +394,7 @@ def build_plan(
         clip_b=clip_b,
         overlap_frames=no,
         segments=(head, overlap_seg, tail),
+        transition=transition,
+        direction=direction,
+        easing=easing,
     )

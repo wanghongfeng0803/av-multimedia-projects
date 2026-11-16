@@ -12,18 +12,23 @@ import json
 import sys
 
 from . import __version__
+from .easing import EASINGS
 from .errors import TransitionError
 from .pipeline import cross_fade
+from .slide import DIRECTIONS
 
 
 def build_parser() -> argparse.ArgumentParser:
     """构造参数解析器（独立函数便于 CLI 单测）。"""
     parser = argparse.ArgumentParser(
         prog="video_transition",
-        description="在两段素材之间做交叉淡化转场（音视频同帧淡化，成片不丢帧）",
+        description=(
+            "在两段素材之间做转场（默认交叉淡化，可选四方向滑动）；"
+            "音视频同帧推进，成片不丢帧"
+        ),
     )
-    parser.add_argument("clip_a", help="第一段素材路径（淡出方）")
-    parser.add_argument("clip_b", help="第二段素材路径（淡入方）")
+    parser.add_argument("clip_a", help="第一段素材路径（移出方）")
+    parser.add_argument("clip_b", help="第二段素材路径（推入方）")
     parser.add_argument("-o", "--output", required=True, help="成片输出路径（.mp4/.mkv）")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -33,6 +38,18 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--frames", type=int, metavar="N",
         help="重叠帧数（整数，与 --overlap 互斥）",
+    )
+    parser.add_argument(
+        "--transition", choices=("fade", "slide"), default="fade",
+        help="转场类型：fade=交叉淡化（默认，旧行为），slide=方向滑动",
+    )
+    parser.add_argument(
+        "--direction", choices=DIRECTIONS, default="right",
+        help="滑动方向（仅 --transition slide 生效）：%(choices)s，默认 %(default)s",
+    )
+    parser.add_argument(
+        "--easing", choices=EASINGS, default="linear",
+        help="速度曲线：%(choices)s，默认 %(default)s",
     )
     parser.add_argument("--crf", type=int, default=23, help="x264 质量（默认 23）")
     parser.add_argument("--preset", default="medium", help="x264 速度档（默认 medium）")
@@ -54,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             overlap_seconds=args.overlap,
             overlap_frames=args.frames,
+            transition=args.transition,
+            direction=args.direction,
+            easing=args.easing,
             crf=args.crf,
             preset=args.preset,
             overwrite=args.overwrite,
@@ -82,9 +102,13 @@ def main(argv: list[str] | None = None) -> int:
             "sample_rate": result.sample_rate,
             "had_audio": list(result.had_audio),
             "encoder": result.encoder,
+            "transition": result.transition,
+            "direction": result.direction,
+            "easing": result.easing,
         }, ensure_ascii=False, indent=2))
     else:
         print(f"完成: {result.output}")
+        print(f"  转场: {result.transition_label}")
         print(f"  帧率 {result.fps_num}/{result.fps_den}，"
               f"{result.width}x{result.height}，采样率 {result.sample_rate}Hz")
         print(f"  逐段账目: {result.describe_segments()}")
