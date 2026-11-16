@@ -44,6 +44,7 @@ from .plan import (
     KIND_HEAD,
     KIND_OVERLAP,
     TRANSITION_SLIDE,
+    TRANSITION_WIPE,
     TransitionPlan,
     build_plan,
     frame_jobs,
@@ -51,6 +52,7 @@ from .plan import (
 from .probe import ClipMeta, ffmpeg_bin, probe_clip
 from .reader import FrameReader, load_pcm_bytes, read_pcm_track
 from .slide import composite_slide_frame
+from .wipe import composite_wipe_frame
 
 __all__ = ["TransitionResult", "cross_fade", "FrameWriter"]
 
@@ -80,12 +82,16 @@ class TransitionResult:
     transition: str = "fade"
     direction: str = "right"
     easing: str = "linear"
+    soft_width: int = 0
 
     @property
     def transition_label(self) -> str:
-        """转场中文标签（淡化 / 滑动-方向 / 曲线），供账目打印。"""
+        """转场中文标签（淡化 / 滑动-方向 / 擦除-方向-软边 / 曲线），供账目打印。"""
         if self.transition == TRANSITION_SLIDE:
             return f"滑动({self.direction},{self.easing})"
+        if self.transition == TRANSITION_WIPE:
+            edge = "硬边" if self.soft_width == 0 else f"软边{self.soft_width}px"
+            return f"擦除({self.direction},{edge},{self.easing})"
         return "交叉淡化"
 
     def describe_segments(self) -> str:
@@ -218,6 +224,7 @@ def cross_fade(
     transition: str = "fade",
     direction: str = "right",
     easing: str = "linear",
+    soft_width: int = 0,
     crf: int = 23,
     preset: str = "medium",
     overwrite: bool = False,
@@ -227,7 +234,9 @@ def cross_fade(
 
     默认 ``transition="fade"`` 为历史交叉淡化，行为与输出逐字节不变；
     ``transition="slide"`` 时按 ``direction``（right/left/down/up）做
-    四方向滑动、``easing`` 选择速度曲线。两种转场共用同一份帧域账本
+    四方向滑动、``easing`` 选择速度曲线；``transition="wipe"`` 时两帧
+    固定、由移动掩码擦除揭画，``soft_width`` 配置软边宽度（0=硬边，
+    超过运动轴会被钳制并告警）。三种转场共用同一份帧域账本
     （成片总帧数恒为 ``Na + Nb - No``，重叠区之外一帧不丢）、同一套
     帧混合器与同一条音频进度曲线。
 
@@ -251,6 +260,7 @@ def cross_fade(
         transition=transition,
         direction=direction,
         easing=easing,
+        soft_width=soft_width,
     )
     jobs = frame_jobs(plan)
     if len(jobs) != plan.output_frames:
@@ -305,6 +315,15 @@ def cross_fade(
                                 blend_buf, frame_a, frame_b,
                                 plan.width, plan.height,
                                 plan.direction, job.shift,
+                            )
+                        elif plan.is_wipe:
+                            # 擦除：固定两帧、按帧任务里的掩码边界与
+                            # 软边宽度做分区混合（纯区端点权重、渐变带
+                            # 整数权重），同样复用 blend_rgb24_frame
+                            composite_wipe_frame(
+                                blend_buf, frame_a, frame_b,
+                                plan.width, plan.height,
+                                plan.direction, job.edge, job.soft_width,
                             )
                         else:
                             blend_rgb24_frame(
@@ -380,6 +399,7 @@ def cross_fade(
         transition=plan.transition,
         direction=plan.direction,
         easing=plan.easing,
+        soft_width=plan.soft_width,
     )
 
 

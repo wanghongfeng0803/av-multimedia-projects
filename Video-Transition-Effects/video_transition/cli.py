@@ -40,16 +40,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="重叠帧数（整数，与 --overlap 互斥）",
     )
     parser.add_argument(
-        "--transition", choices=("fade", "slide"), default="fade",
-        help="转场类型：fade=交叉淡化（默认，旧行为），slide=方向滑动",
+        "--transition", choices=("fade", "slide", "wipe"), default="fade",
+        help="转场类型：fade=交叉淡化（默认，旧行为），slide=方向滑动，"
+             "wipe=擦除（固定画面、移动掩码）",
     )
     parser.add_argument(
         "--direction", choices=DIRECTIONS, default="right",
-        help="滑动方向（仅 --transition slide 生效）：%(choices)s，默认 %(default)s",
+        help="运动方向（slide/wipe 生效）：%(choices)s，默认 %(default)s",
     )
     parser.add_argument(
         "--easing", choices=EASINGS, default="linear",
         help="速度曲线：%(choices)s，默认 %(default)s",
+    )
+    parser.add_argument(
+        "--soft-width", type=int, metavar="PIXELS", default=0,
+        help="擦除软边宽度（像素，仅 --transition wipe 生效），0=硬边；"
+             "超过画面运动轴长度时自动钳制并告警，默认 %(default)s",
     )
     parser.add_argument("--crf", type=int, default=23, help="x264 质量（默认 23）")
     parser.add_argument("--preset", default="medium", help="x264 速度档（默认 medium）")
@@ -74,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             transition=args.transition,
             direction=args.direction,
             easing=args.easing,
+            soft_width=args.soft_width,
             crf=args.crf,
             preset=args.preset,
             overwrite=args.overwrite,
@@ -105,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             "transition": result.transition,
             "direction": result.direction,
             "easing": result.easing,
+            "soft_width": result.soft_width,
         }, ensure_ascii=False, indent=2))
     else:
         print(f"完成: {result.output}")

@@ -121,7 +121,7 @@ class TestSlidePlan:
     def test_invalid_transition_rejected(self):
         a, b = _meta("a", frames=50), _meta("b", frames=40)
         with pytest.raises(PlanError):
-            build_plan(a, b, overlap_frames=5, transition="wipe")
+            build_plan(a, b, overlap_frames=5, transition="dissolve")
 
     def test_invalid_direction_rejected(self):
         a, b = _meta("a", frames=50), _meta("b", frames=40)

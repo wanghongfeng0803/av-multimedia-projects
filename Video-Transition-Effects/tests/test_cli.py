@@ -65,6 +65,32 @@ class TestParser:
                 "--easing", "bounce",
             ])
 
+    def test_soft_width_defaults_to_zero(self):
+        args = build_parser().parse_args(
+            ["a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5"]
+        )
+        assert args.soft_width == 0
+
+    def test_wipe_args_parsed(self):
+        args = build_parser().parse_args([
+            "a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5",
+            "--transition", "wipe",
+            "--direction", "down",
+            "--soft-width", "12",
+            "--easing", "ease_out",
+        ])
+        assert args.transition == "wipe"
+        assert args.direction == "down"
+        assert args.soft_width == 12
+        assert args.easing == "ease_out"
+
+    def test_bad_transition_rejected_by_argparse(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([
+                "a.mp4", "b.mp4", "-o", "o.mp4", "--frames", "5",
+                "--transition", "dissolve",
+            ])
+
 
 class TestMainErrors:
     def test_missing_input_returns_code_2(self, tmp_path):

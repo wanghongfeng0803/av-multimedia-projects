@@ -39,6 +39,7 @@ from .easing import EASINGS, EASING_LINEAR
 from .errors import PlanError
 from .probe import ClipMeta
 from .slide import DIRECTIONS, DIRECTION_RIGHT
+from .wipe import clamp_soft_width, wipe_edge
 
 __all__ = [
     "Segment",
@@ -53,6 +54,7 @@ __all__ = [
     "KIND_TAIL",
     "TRANSITION_FADE",
     "TRANSITION_SLIDE",
+    "TRANSITION_WIPE",
     "TRANSITIONS",
 ]
 
@@ -65,9 +67,11 @@ KIND_TAIL = "tail"
 TRANSITION_FADE = "fade"
 #: 四方向滑动
 TRANSITION_SLIDE = "slide"
+#: 擦除（固定画面 + 移动掩码，方向与软边可配）
+TRANSITION_WIPE = "wipe"
 
 #: 全部合法转场类型
-TRANSITIONS = (TRANSITION_FADE, TRANSITION_SLIDE)
+TRANSITIONS = (TRANSITION_FADE, TRANSITION_SLIDE, TRANSITION_WIPE)
 
 
 @dataclass(frozen=True)
@@ -104,8 +108,13 @@ class FrameJob:
         纯 A 段为 (0,1)，纯 B 段为 (1,1)。淡化时它同时是像素混合
         权重；滑动时像素按 :attr:`shift` 做区域拷贝，本字段仍驱动
         音轨增益（与画面推进共用同一条进度曲线）；
-    :param transition: 该帧所属转场类型（fade/slide）；
-    :param shift: 滑动转场沿运动轴的整数像素位移，非滑动帧为 0。
+    :param transition: 该帧所属转场类型（fade/slide/wipe）；
+    :param shift: 滑动转场沿运动轴的整数像素位移，非滑动帧为 0；
+    :param edge: 擦除转场的掩码边界位置（扩展行程
+        ``[-soft_width, 轴长]``，见 :mod:`video_transition.wipe`），
+        非擦除帧为 0；
+    :param soft_width: 擦除转场的软边宽度（像素，0=硬边），
+        非擦除帧为 0。
     """
 
     out_index: int
@@ -116,6 +125,8 @@ class FrameJob:
     weight_b_den: int
     transition: str = TRANSITION_FADE
     shift: int = 0
+    edge: int = 0
+    soft_width: int = 0
 
     @property
     def is_overlap(self) -> bool:
@@ -134,6 +145,7 @@ class TransitionPlan:
     transition: str = TRANSITION_FADE
     direction: str = DIRECTION_RIGHT
     easing: str = EASING_LINEAR
+    soft_width: int = 0
 
     @property
     def fps_num(self) -> int:
@@ -157,8 +169,20 @@ class TransitionPlan:
 
     @property
     def is_slide(self) -> bool:
-        """是否为滑动转场（否则为交叉淡化）。"""
+        """是否为滑动转场（否则为交叉淡化或擦除）。"""
         return self.transition == TRANSITION_SLIDE
+
+    @property
+    def is_wipe(self) -> bool:
+        """是否为擦除转场。"""
+        return self.transition == TRANSITION_WIPE
+
+    @property
+    def axis_length(self) -> int:
+        """转场运动轴长度：水平方向取宽、垂直方向取高。"""
+        from .slide import HORIZONTAL_DIRECTIONS
+
+        return self.width if self.direction in HORIZONTAL_DIRECTIONS else self.height
 
     @property
     def output_frames(self) -> int:
@@ -231,9 +255,9 @@ def transition_gain_fraction(
 
     * 淡化（``fade``）：保持旧语义 ``k/(No-1)``，单帧取 1/2，
       与历史输出逐字节一致；
-    * 滑动（``slide``）：取速度曲线的有理数进度（见
-      :func:`video_transition.easing.eased_fraction`），画面推进
-      到哪、声音增益就跟到哪。
+    * 滑动（``slide``）与擦除（``wipe``）：取速度曲线的有理数进度
+      （见 :func:`video_transition.easing.eased_fraction`），画面推进
+      到哪、声音增益就跟到哪——擦除掩码与转场时长共用同一条时间线。
     """
     # 复用淡化版的边界校验
     fade_weight_b(k, overlap_frames)
@@ -241,7 +265,7 @@ def transition_gain_fraction(
         if overlap_frames == 1:
             return 1, 2
         return k, overlap_frames - 1
-    if transition == TRANSITION_SLIDE:
+    if transition in (TRANSITION_SLIDE, TRANSITION_WIPE):
         from .easing import eased_fraction
 
         return eased_fraction(k, overlap_frames, easing)
@@ -271,12 +295,19 @@ def frame_jobs(plan: TransitionPlan) -> list[FrameJob]:
             k, no, plan.transition, plan.easing
         )
         shift = 0
+        edge = 0
         if plan.is_slide:
             from .easing import eased_shift
             from .slide import HORIZONTAL_DIRECTIONS
 
             axis = plan.width if plan.direction in HORIZONTAL_DIRECTIONS else plan.height
             shift = eased_shift(k, no, axis, plan.easing)
+        elif plan.is_wipe:
+            # 擦除：掩码边界与转场时长共用同一条进度曲线（wipe_edge
+            # 内部即 eased_fraction），软边宽度已在 build_plan 钳制
+            edge = wipe_edge(
+                k, no, plan.axis_length, plan.soft_width, plan.easing
+            )
         jobs.append(
             FrameJob(
                 f, KIND_OVERLAP,
@@ -285,6 +316,8 @@ def frame_jobs(plan: TransitionPlan) -> list[FrameJob]:
                 wnum, wden,
                 transition=plan.transition,
                 shift=shift,
+                edge=edge,
+                soft_width=plan.soft_width if plan.is_wipe else 0,
             )
         )
 
@@ -305,6 +338,7 @@ def build_plan(
     transition: str = TRANSITION_FADE,
     direction: str = DIRECTION_RIGHT,
     easing: str = EASING_LINEAR,
+    soft_width: int = 0,
 ) -> TransitionPlan:
     """根据两段素材的探针结果与重叠配置构造 :class:`TransitionPlan`。
 
@@ -317,13 +351,19 @@ def build_plan(
     两个参数都不给时抛 :class:`PlanError`，避免「零重叠」悄悄退化成
     硬切而调用方毫无感知。
 
-    :param transition: ``fade``（交叉淡化，默认，旧行为不变）或
-        ``slide``（四方向滑动）；
-    :param direction: 滑动方向，仅 ``slide`` 时生效，取
-        :data:`video_transition.slide.DIRECTIONS` 之一；
+    :param transition: ``fade``（交叉淡化，默认，旧行为不变）、
+        ``slide``（四方向滑动）或 ``wipe``（擦除，固定画面 + 移动
+        掩码）；
+    :param direction: 运动方向，仅 ``slide``/``wipe`` 时生效，取
+        :data:`video_transition.slide.DIRECTIONS` 之一，名字描述 B 的
+        推入/揭开方向；
     :param easing: 速度曲线，取
         :data:`video_transition.easing.EASINGS` 之一；淡化默认线性
-        即历史等间隔权重。
+        即历史等间隔权重；
+    :param soft_width: 擦除软边宽度（沿运动轴的像素数，0=硬边），
+        仅 ``wipe`` 时生效。超过运动轴长度会被钳到轴长并发出
+        :class:`video_transition.wipe.WipeSoftWidthWarning`，负值或
+        非整数抛 :class:`PlanError`。
     """
     # 1) 两段素材必须同帧率、同尺寸：帧读取器吐出的是固定尺寸裸流，
     #    淡化是逐像素整数运算，不做隐式缩放/重采样以免账本失真。
@@ -345,6 +385,12 @@ def build_plan(
         raise PlanError(f"未知滑动方向: {direction!r}，可选 {DIRECTIONS}")
     if easing not in EASINGS:
         raise PlanError(f"未知速度曲线: {easing!r}，可选 {EASINGS}")
+    # 软边类型/负值先在所有转场上统一校验；仅 wipe 会真正使用并钳制，
+    # 其余转场该参数不生效（与 direction 对 fade 不生效同一约定）。
+    if not isinstance(soft_width, int) or isinstance(soft_width, bool):
+        raise PlanError(f"软边宽度必须为整数，收到 {soft_width!r}")
+    if soft_width < 0:
+        raise PlanError(f"软边宽度不能为负，收到 {soft_width}")
 
     # 2) 解析重叠帧数（秒数配置换算到帧域，之后全部按整数帧说话）
     if overlap_frames is not None and overlap_seconds is not None:
@@ -389,6 +435,16 @@ def build_plan(
         a_start=-1,
         b_start=no,
     )
+    # 擦除软边沿运动轴生效，超轴长在这里钳制并告警（只在 wipe 时）；
+    # 钳制后的宽度写进计划，掩码几何据此保证无黑边、锚点精确。
+    effective_soft = 0
+    if transition == TRANSITION_WIPE:
+        from .slide import HORIZONTAL_DIRECTIONS
+
+        axis = (
+            clip_a.width if direction in HORIZONTAL_DIRECTIONS else clip_a.height
+        )
+        effective_soft = clamp_soft_width(soft_width, axis)
     return TransitionPlan(
         clip_a=clip_a,
         clip_b=clip_b,
@@ -397,4 +453,5 @@ def build_plan(
         transition=transition,
         direction=direction,
         easing=easing,
+        soft_width=effective_soft,
     )
