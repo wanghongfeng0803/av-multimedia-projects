@@ -12,6 +12,7 @@ import os
 import pytest
 
 from color_grading.chunks import frame_chunk_sizes, map_stream
+from color_grading.colorspace import map_chunk
 from color_grading.errors import StreamTruncatedError
 from color_grading.lut import IDENTITY_LUT, build_lut
 
@@ -106,3 +107,65 @@ def test_on_frame_callback_counts_frames():
     map_stream(io.BytesIO(data), io.BytesIO(), W, H, IDENTITY_LUT,
                chunk_rows=2, on_frame=seen.append)
     assert seen == [1, 2, 3]
+
+
+# ----------------------------------------------------- 色相 / 饱和度通道
+
+
+def test_hsv_only_path_matches_direct_map_chunk():
+    """仅色相/饱和度（LUT 恒等）：并行结果 == 对整段直接 map_chunk。"""
+    data = _random_frames(W, H, 3)
+    out = io.BytesIO()
+    frames = map_stream(
+        io.BytesIO(data), out, W, H, IDENTITY_LUT,
+        hue=35, saturation=25, workers=2, chunk_rows=2,
+    )
+    assert frames == 3
+    assert out.getvalue() == map_chunk(data, 35, 25)
+
+
+def test_hsv_zero_still_uses_identity_passthrough():
+    """色相/饱和度为 0 且 LUT 恒等时走直通路径，逐字节一致。"""
+    data = _random_frames(W, H, 2)
+    out = io.BytesIO()
+    map_stream(io.BytesIO(data), out, W, H, IDENTITY_LUT,
+               hue=0, saturation=0, chunk_rows=2)
+    assert out.getvalue() == data
+
+
+def test_lut_then_hsv_fixed_order_is_byte_exact():
+    """固定顺序 LUT → 色相 → 饱和度：并行管道结果 == 同顺序的手工组合。"""
+    data = _random_frames(W, H, 2)
+    lut = build_lut(brightness=12, contrast=18)
+    out = io.BytesIO()
+    map_stream(
+        io.BytesIO(data), out, W, H, lut,
+        hue=-40, saturation=30, workers=2, chunk_rows=3,
+    )
+    expected = map_chunk(data.translate(lut), -40, 30)
+    assert out.getvalue() == expected
+
+
+def test_rgb_channel_order_is_locked():
+    """RGB 字节序锁定：单像素 (R=255,G=0,B=0) 旋转 +120° 必须得到纯绿。
+
+    若某处误用 BGR，红会被当成蓝处理、结果将是纯红→蓝，本测试即失败。
+    这里通过完整 map_stream（含 worker 分发）验证，而不只是纯函数。
+    """
+    # 一帧 1x1（W=1,H=1），rgb24 三字节 R,G,B = 255,0,0
+    red = bytes([255, 0, 0])
+    out = io.BytesIO()
+    map_stream(io.BytesIO(red), out, 1, 1, IDENTITY_LUT,
+               hue=120, saturation=0, workers=1, chunk_rows=1)
+    assert out.getvalue() == bytes([0, 255, 0])  # 逆时针 +120°：红 → 绿
+
+
+def test_desaturation_runs_through_parallel_path():
+    """饱和度 -100 经进程池路径后每个像素 R=G=B（去色生效）。"""
+    data = _random_frames(W, H, 1)
+    out = io.BytesIO()
+    map_stream(io.BytesIO(data), out, W, H, IDENTITY_LUT,
+               hue=0, saturation=-100, workers=2, chunk_rows=2)
+    result = out.getvalue()
+    for i in range(0, len(result), 3):
+        assert result[i] == result[i + 1] == result[i + 2]

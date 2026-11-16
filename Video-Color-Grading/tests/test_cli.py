@@ -7,10 +7,12 @@ from color_grading.errors import InputNotFoundError, OutputExistsError
 
 
 def test_parser_defaults_keep_legacy_behavior():
-    """无参数调用的默认值：亮度/对比度均为 0（恒等映射）。"""
+    """无参数调用的默认值：四项调整均为 0（恒等映射）。"""
     args = build_parser().parse_args(["in.mp4", "-o", "out.mp4"])
     assert args.brightness == 0.0
     assert args.contrast == 0.0
+    assert args.hue == 0.0
+    assert args.saturation == 0.0
     assert args.workers is None
     assert not args.overwrite
 
@@ -22,6 +24,22 @@ def test_parser_accepts_adjustment_args():
     assert args.brightness == 25.5
     assert args.contrast == -40.0
     assert args.workers == 4
+
+
+def test_parser_accepts_hue_and_saturation():
+    args = build_parser().parse_args(
+        ["in.mp4", "-o", "out.mp4", "-H", "120", "-s", "-50"]
+    )
+    assert args.hue == 120.0
+    assert args.saturation == -50.0
+
+
+def test_parser_accepts_long_hue_saturation_names():
+    args = build_parser().parse_args(
+        ["in.mp4", "-o", "out.mp4", "--hue", "-30", "--saturation", "25"]
+    )
+    assert args.hue == -30.0
+    assert args.saturation == 25.0
 
 
 def test_missing_input_returns_input_not_found(tmp_path, capsys):

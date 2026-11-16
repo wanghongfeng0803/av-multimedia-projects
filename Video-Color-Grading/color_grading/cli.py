@@ -6,6 +6,7 @@ import argparse
 import sys
 
 from .chunks import DEFAULT_CHUNK_ROWS
+from .colorspace import HUE_MAX, HUE_MIN, SATURATION_MAX, SATURATION_MIN
 from .errors import ColorGradingError
 from .lut import BRIGHTNESS_MAX, BRIGHTNESS_MIN, CONTRAST_MAX, CONTRAST_MIN
 from .pipeline import adjust
@@ -14,7 +15,7 @@ from .pipeline import adjust
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="color_grading",
-        description="视频亮度/对比度调整：按帧处理、保留音轨、分块并行。",
+        description="视频亮度/对比度/色相/饱和度调整：按帧处理、保留音轨、分块并行。",
     )
     parser.add_argument("input", help="输入视频文件")
     parser.add_argument("-o", "--output", required=True, help="输出视频文件")
@@ -25,6 +26,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-c", "--contrast", type=float, default=0.0,
         help=f"对比度 [{CONTRAST_MIN:g}, {CONTRAST_MAX:g}]，超范围自动钳制，默认 0",
+    )
+    parser.add_argument(
+        "-H", "--hue", type=float, default=0.0,
+        help=(
+            f"色相旋转角度（度）[{HUE_MIN:g}, {HUE_MAX:g}]，逆时针为正，"
+            "超范围自动钳制，默认 0"
+        ),
+    )
+    parser.add_argument(
+        "-s", "--saturation", type=float, default=0.0,
+        help=(
+            f"饱和度 [{SATURATION_MIN:g}, {SATURATION_MAX:g}]，-100 完全去色、"
+            "+100 翻倍，超范围自动钳制，默认 0"
+        ),
     )
     parser.add_argument("--workers", type=int, default=None, help="并行进程数（默认 CPU 核数）")
     parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
@@ -43,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             brightness=args.brightness,
             contrast=args.contrast,
+            hue=args.hue,
+            saturation=args.saturation,
             workers=args.workers,
             chunk_rows=args.chunk_rows,
             crf=args.crf,
@@ -60,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"提示: {msg}", file=sys.stderr)
     print(
         f"完成: {result.frames} 帧, {result.width}x{result.height}@{result.fps:g}, "
-        f"亮度 {result.brightness:g} 对比度 {result.contrast:g}, "
+        f"亮度 {result.brightness:g} 对比度 {result.contrast:g} "
+        f"色相 {result.hue:g} 饱和度 {result.saturation:g}, "
         f"{'含音轨' if result.has_audio else '无音轨'}, "
         f"耗时 {result.elapsed_seconds:.1f}s -> {result.output_path}"
     )

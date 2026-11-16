@@ -31,6 +31,7 @@ from typing import Callable
 
 from .binaries import find_ffmpeg
 from .chunks import DEFAULT_CHUNK_ROWS, map_stream
+from .colorspace import clamp_color_params
 from .errors import (
     FFmpegRunError,
     InputNotFoundError,
@@ -51,6 +52,8 @@ class GradeResult:
     output_path: str
     brightness: float
     contrast: float
+    hue: float
+    saturation: float
     width: int
     height: int
     fps: float
@@ -78,6 +81,8 @@ def adjust(
     output_path: str,
     brightness: float = 0.0,
     contrast: float = 0.0,
+    hue: float = 0.0,
+    saturation: float = 0.0,
     *,
     workers: int | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
@@ -86,13 +91,24 @@ def adjust(
     overwrite: bool = False,
     on_frame: Callable[[int], None] | None = None,
 ) -> GradeResult:
-    """调整视频亮度 / 对比度并保留音轨。
+    """调整视频亮度 / 对比度 / 色相 / 饱和度并保留音轨。
 
-    默认参数（``brightness=0, contrast=0``）为恒等映射，输出像素
-    与输入逐字节一致（裸流级别），这是旧无参数调用的兼容基线。
+    默认参数（四项均为 0）为恒等映射，输出像素与输入逐字节一致
+    （裸流级别），这是旧无参数调用的兼容基线。
+
+    全工具像素统一为 **RGB** 字节序（ffmpeg ``rgb24``），不存在 BGR
+    分支。处理顺序固定为：
+
+    1. 亮度 / 对比度 1D LUT（逐通道）；
+    2. 色相旋转（``hue`` 度，逆时针为正）；
+    3. 饱和度缩放（``saturation`` 百分比）。
+
+    即同时给色相与饱和度时**先色相、后饱和度**，顺序写死，不可调换。
 
     :param brightness: 亮度，[-100, 100]，超范围自动钳制并提示
     :param contrast: 对比度，[-100, 100]，超范围自动钳制并提示
+    :param hue: 色相旋转角，[-180, 180]（度，逆时针为正），超范围钳制
+    :param saturation: 饱和度，[-100, 100]，超范围自动钳制并提示
     :param workers: 并行进程数，默认 CPU 核数
     :param chunk_rows: 分块行数（内存粒度）
     :param crf: x264 恒定质量因子
@@ -111,6 +127,8 @@ def adjust(
 
     # 超范围钳制并收集提示（同时也会触发 UserWarning）。
     brightness, contrast, messages = clamp_params(brightness, contrast)
+    hue, saturation, hsv_messages = clamp_color_params(hue, saturation)
+    messages.extend(hsv_messages)
     info = probe_video(input_path)
 
     # 整个流程唯一一次建表；之后所有帧 / 块 / worker 复用。
@@ -172,6 +190,7 @@ def adjust(
             frames = map_stream(
                 decoder.stdout, encoder.stdin,
                 info.width, info.height, lut,
+                hue=hue, saturation=saturation,
                 workers=workers, chunk_rows=chunk_rows, on_frame=on_frame,
             )
         except (BrokenPipeError, ConnectionResetError):
@@ -203,6 +222,8 @@ def adjust(
         output_path=output_path,
         brightness=brightness,
         contrast=contrast,
+        hue=hue,
+        saturation=saturation,
         width=info.width,
         height=info.height,
         fps=info.fps,
