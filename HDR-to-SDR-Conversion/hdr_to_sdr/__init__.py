@@ -37,13 +37,29 @@ from .colorscience import (
 )
 from .tonemap import (
     TONE_REINHARD,
+    TONE_REINHARD_CLASSIC,
     TONE_BT2390,
     TONE_CLIP,
     DEFAULT_TONE_METHOD,
+    REINHARD_WHITE_MIN,
+    REINHARD_WHITE_MAX,
+    DEFAULT_REINHARD_WHITE,
+    clamp_reinhard_white,
     tone_map_pixel,
     reinhard_scale,
+    reinhard_classic_scale,
     bt2390_scale,
     resolve_tone_method,
+)
+from .encoders import (
+    SOFTWARE_ENCODERS,
+    HARDWARE_ENCODERS,
+    ALL_ENCODERS,
+    EncoderSpec,
+    encoder_spec,
+    list_available_encoders,
+    check_encoder_works,
+    is_software_encoder,
 )
 from .probe import HDRType, HDRInfo, probe_hdr, parse_hdr_info
 from .frames import FrameProcessor
@@ -77,13 +93,28 @@ __all__ = [
     "range_constants",
     # 色调映射
     "TONE_REINHARD",
+    "TONE_REINHARD_CLASSIC",
     "TONE_BT2390",
     "TONE_CLIP",
     "DEFAULT_TONE_METHOD",
+    "REINHARD_WHITE_MIN",
+    "REINHARD_WHITE_MAX",
+    "DEFAULT_REINHARD_WHITE",
+    "clamp_reinhard_white",
     "tone_map_pixel",
     "reinhard_scale",
+    "reinhard_classic_scale",
     "bt2390_scale",
     "resolve_tone_method",
+    # 编码器（软编/硬编）
+    "SOFTWARE_ENCODERS",
+    "HARDWARE_ENCODERS",
+    "ALL_ENCODERS",
+    "EncoderSpec",
+    "encoder_spec",
+    "list_available_encoders",
+    "check_encoder_works",
+    "is_software_encoder",
     # 探测 / 引擎 / 管线
     "HDRType",
     "HDRInfo",

@@ -15,10 +15,16 @@ import argparse
 import sys
 
 from .colorscience import RANGE_FULL, RANGE_LIMITED
+from .encoders import ALL_ENCODERS
 from .errors import HDRConversionError
 from .pipeline import convert_hdr_to_sdr
 from .probe import probe_hdr
-from .tonemap import TONE_BT2390, TONE_CLIP, TONE_REINHARD
+from .tonemap import (
+    TONE_BT2390,
+    TONE_CLIP,
+    TONE_REINHARD,
+    TONE_REINHARD_CLASSIC,
+)
 from .transfer import TRANSFER_HLG, TRANSFER_PQ
 
 __all__ = ["build_parser", "main"]
@@ -35,15 +41,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("output", help="输出 SDR 视频文件")
     parser.add_argument(
         "--tone",
-        choices=[TONE_REINHARD, TONE_BT2390, TONE_CLIP],
+        choices=[
+            TONE_REINHARD,
+            TONE_REINHARD_CLASSIC,
+            TONE_BT2390,
+            TONE_CLIP,
+        ],
         default=TONE_REINHARD,
-        help="色调映射曲线（默认 reinhard，高光软压缩不过曝）",
+        help="色调映射曲线（默认 reinhard 膝盖式亮度压缩，行为保持不变；"
+        "reinhard_classic 为经典 L/(1+L) 全局压缩，可用 --white 调白点）",
+    )
+    parser.add_argument(
+        "--white",
+        dest="reinhard_white",
+        type=float,
+        default=1.0,
+        metavar="W",
+        help="经典 Reinhard 白点（相对 peak 的倍数，默认 1.0）；"
+        "越大压缩越温和，越界自动钳制到 [1e-3, 100] 并提示；"
+        "仅 --tone reinhard_classic 时生效",
     )
     parser.add_argument(
         "--codec",
-        choices=["libx264", "libx265"],
+        choices=list(ALL_ENCODERS),
         default="libx264",
-        help="输出编码器（默认 libx264）",
+        help="输出编码器（默认 libx264 软编；可选 nvenc/qsv/amf 硬编，"
+        "软硬编共用同一处理引擎，画面一致仅末端编码不同）",
     )
     parser.add_argument(
         "--10bit",
@@ -125,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
             preset=args.preset,
             workers=max(1, args.workers),
             progress_every=max(0, args.progress),
+            reinhard_white=args.reinhard_white,
         )
     except HDRConversionError as exc:
         print(f"错误: {exc}", file=sys.stderr)

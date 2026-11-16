@@ -21,10 +21,15 @@ from dataclasses import dataclass
 
 from .binaries import find_ffmpeg, find_ffprobe
 from .colorscience import RANGE_LIMITED, RANGE_FULL
+from .encoders import (
+    build_quality_args,
+    build_vui_args,
+    encoder_spec,
+)
 from .errors import FFmpegRunError, InputNotFoundError
 from .frames import FrameProcessor
 from .probe import HDRInfo, probe_hdr
-from .tonemap import DEFAULT_TONE_METHOD
+from .tonemap import DEFAULT_TONE_METHOD, DEFAULT_REINHARD_WHITE
 from .transfer import TRANSFER_PQ, TRANSFER_HLG
 
 __all__ = ["ConversionResult", "convert_hdr_to_sdr", "build_decode_cmd", "build_encode_cmd"]
@@ -117,23 +122,20 @@ def build_encode_cmd(
     else:
         out_pix = "yuv444p" if dst_bits == 8 else "yuv444p10le"
 
-    # 实测 ffmpeg 9.0 的 libx264/libx265 外层 -color_trc/-color_primaries
-    # 不会写进码流 VUI（ffprobe 只读到 matrix），必须通过编码器内联参数
-    # colorprim/transfer/colormatrix 才能被确证为 BT.709 SDR。
-    vui = "colorprim=bt709:transfer=bt709:colormatrix=bt709"
-    inline_param = "-x264-params" if codec == "libx264" else "-x265-params"
+    # 软编（libx264/libx265）实测外层 -color_* 不进码流，必须内联 VUI；
+    # 硬编（nvenc/qsv/amf）外层标签会写进码流。质量控制各厂参数不同，
+    # 统一在 encoders 模块按编码器族翻译，画面数学在 Python 引擎侧完全一致。
+    inline_vui, outer_vui = build_vui_args(codec)
+    quality = build_quality_args(codec, crf, preset)
 
     cmd += [
         "-map", "0:v:0",
         "-c:v", codec,
-        "-preset", preset,
-        "-crf", str(crf),
+        *quality,
         "-pix_fmt", out_pix,
-        inline_param, vui,
+        *inline_vui,
         # 外层标签保留：部分容器/版本仍读外层，内外双写互为兜底
-        "-colorspace", "bt709",
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
+        *outer_vui,
         "-color_range", "tv" if dst_range == RANGE_LIMITED else "pc",
         # 丢弃容器级全局元数据，避免源 HDR_FORMAT 等标签残留
         "-map_metadata", "-1",
@@ -165,16 +167,21 @@ def convert_hdr_to_sdr(
     preset: str = "medium",
     workers: int = 1,
     progress_every: int = 0,
+    reinhard_white: float = DEFAULT_REINHARD_WHITE,
 ) -> ConversionResult:
     """执行完整 HDR→SDR 转换。
 
     :param assume: 元数据无法确证类型时的显式兜底（"pq"/"hlg"）。
-    :param tone_method: reinhard / bt2390 / clip。
-    :param codec: 视频编码器（libx264 / libx265）。
+    :param tone_method: reinhard / reinhard_classic / bt2390 / clip。
+    :param codec: 视频编码器，软编 libx264/libx265 或硬编
+        h264_nvenc/hevc_nvenc/h264_qsv/hevc_qsv/h264_amf/hevc_amf。
+        软/硬编共用同一 Python 引擎产出的原始帧，画面一致、仅末端编码不同。
     :param dst_bits: 输出码深 8 或 10。
     :param dst_range: limited / full。
     :param workers: 帧内分带并行进程数，1 为串行（结果逐像素一致）。
     :param progress_every: 每处理 N 帧打印一次进度，0 表示不打印。
+    :param reinhard_white: 经典 Reinhard（reinhard_classic）白点，相对
+        peak 的倍数；越界钳制并 warning，其它色调方法忽略。
     :raises InputNotFoundError: 输入不存在。
     :raises FFmpegRunError: ffmpeg 解码/编码失败。
     """
@@ -184,6 +191,8 @@ def convert_hdr_to_sdr(
         raise ValueError("输出码深仅支持 8 或 10")
     if dst_range not in (RANGE_LIMITED, RANGE_FULL):
         raise ValueError("dst_range 仅支持 limited / full")
+    # encoder_spec 对未知编码器抛 ValueError（白名单校验，拒绝注入任意 -c:v）
+    encoder_spec(codec)
 
     info = probe_hdr(src_path, assume=assume)
     ffmpeg = find_ffmpeg()
@@ -198,6 +207,7 @@ def convert_hdr_to_sdr(
         peak_nits=info.peak_nits,
         dst_bits=dst_bits,
         dst_range=dst_range,
+        reinhard_white=reinhard_white,
     )
 
     decode_cmd, raw_fmt, bpp = build_decode_cmd(ffmpeg, src_path, info)

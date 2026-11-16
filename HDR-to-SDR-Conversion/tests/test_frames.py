@@ -121,6 +121,54 @@ class TestYUVPath:
         assert all(c == 128 for c in u)
 
 
+class TestReinhardClassicEngine:
+    def _proc(self, **kw):
+        return FrameProcessor(
+            TRANSFER_PQ, 10, RANGE_LIMITED, False,
+            tone_method="reinhard_classic", **kw
+        )
+
+    def test_white_clamped_at_construction(self):
+        # 越界白点在构造期即被钳制，处理器上持有确定的合法值
+        with pytest.warns(UserWarning):
+            proc = self._proc(reinhard_white=-9.0)
+        from hdr_to_sdr.tonemap import REINHARD_WHITE_MIN
+        assert proc.reinhard_white == REINHARD_WHITE_MIN
+
+    def test_different_white_changes_output(self):
+        frame = _make_yuv444p16_frame(8, 4, 900, 542, 542)
+        out_w1 = self._proc(reinhard_white=1.0).process_frame(frame, 8, 4)
+        out_w4 = self._proc(reinhard_white=4.0).process_frame(frame, 8, 4)
+        y1, _, _ = _parse_yuv444p16(out_w1, 8, 4)
+        y4, _, _ = _parse_yuv444p16(out_w4, 8, 4)
+        # white 大压缩轻 → Y 码值更高（至少有一个像素能区分）
+        assert sum(y4) >= sum(y1)
+        assert out_w1 != out_w4
+
+    def test_deterministic_two_runs(self):
+        # 需求：同输入两次一致（逐字节）
+        proc = self._proc(reinhard_white=2.0)
+        frame = _make_yuv444p16_frame(16, 8, 700, 400, 600)
+        assert proc.process_frame(frame, 16, 8) == proc.process_frame(frame, 16, 8)
+
+    def test_band_parallel_matches_serial_classic(self):
+        proc = self._proc(reinhard_white=1.5)
+        frame = _make_yuv444p16_frame(32, 16, 700, 400, 600)
+        serial = proc.process_frame(frame, 32, 16)
+        parallel = proc.process_bands(frame, 32, 16, workers=2, band_height=8)
+        assert serial == parallel
+
+    def test_output_in_limited_range(self):
+        proc = self._proc()
+        for y_code in (64, 512, 940, 1023):
+            frame = _make_yuv444p16_frame(4, 4, y_code, 542, 542)
+            out = proc.process_frame(frame, 4, 4)
+            y, u, v = _parse_yuv444p16(out, 4, 4)
+            assert all(16 <= c <= 235 for c in y)
+            assert all(16 <= c <= 240 for c in u)
+            assert all(16 <= c <= 240 for c in v)
+
+
 class TestRGBPath:
     def _make_gbrpf32_frame(self, width, height, r, g, b):
         plane = width * height

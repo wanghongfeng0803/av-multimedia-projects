@@ -15,15 +15,24 @@ import pytest
 from hdr_to_sdr.binaries import find_ffprobe
 from hdr_to_sdr.pipeline import convert_hdr_to_sdr, build_decode_cmd, build_encode_cmd
 from hdr_to_sdr.probe import probe_hdr
+from hdr_to_sdr.encoders import (
+    HARDWARE_ENCODERS,
+    check_encoder_works,
+)
 from hdr_to_sdr.errors import (
     UnsupportedHDRTypeError,
     InputNotFoundError,
-    FFmpegRunError,
 )
 from hdr_to_sdr.transfer import TRANSFER_PQ, TRANSFER_HLG
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="环境中未安装 ffmpeg"
+)
+
+# 本机运行时真正可用的硬编（编译进来≠可用，需真实编码冒烟通过）
+_WORKING_HW = [name for name in HARDWARE_ENCODERS if check_encoder_works(name)]
+hw_available = pytest.mark.skipif(
+    not _WORKING_HW, reason="本机无运行时可用的 GPU 硬编（nvenc/qsv/amf）"
 )
 
 
@@ -128,12 +137,38 @@ class TestHLGConversion:
 
 
 class TestToneMethods:
-    @pytest.mark.parametrize("method", ["reinhard", "bt2390", "clip"])
+    @pytest.mark.parametrize(
+        "method", ["reinhard", "reinhard_classic", "bt2390", "clip"]
+    )
     def test_all_methods_produce_valid_output(self, pq_file, work_dir, method):
         out = os.path.join(work_dir, f"tone_{method}.mp4")
         result = convert_hdr_to_sdr(pq_file, out, tone_method=method)
         assert os.path.isfile(out)
         assert result.tone_method == method
+
+    def test_classic_reinhard_with_white(self, pq_file, work_dir):
+        """经典 Reinhard + 可调白点端到端：白点不同产出都合法可播放。"""
+        out1 = os.path.join(work_dir, "classic_w1.mp4")
+        out4 = os.path.join(work_dir, "classic_w4.mp4")
+        r1 = convert_hdr_to_sdr(
+            pq_file, out1, tone_method="reinhard_classic", reinhard_white=1.0
+        )
+        r4 = convert_hdr_to_sdr(
+            pq_file, out4, tone_method="reinhard_classic", reinhard_white=4.0
+        )
+        assert r1.tone_method == "reinhard_classic"
+        assert r1.frames_processed == r4.frames_processed
+        assert os.path.getsize(out1) > 0 and os.path.getsize(out4) > 0
+
+    def test_white_out_of_range_clamps_with_warning(self, pq_file, work_dir):
+        """越界白点：钳制 + warning，但转换仍成功完成。"""
+        out = os.path.join(work_dir, "classic_clamp.mp4")
+        with pytest.warns(UserWarning):
+            convert_hdr_to_sdr(
+                pq_file, out, tone_method="reinhard_classic",
+                reinhard_white=99999.0,
+            )
+        assert os.path.isfile(out)
 
     def test_parallel_matches_serial_output(self, pq_file, work_dir):
         """workers=2 与串行应产出同样可播放、同尺寸、同帧数的文件。"""
@@ -142,6 +177,58 @@ class TestToneMethods:
         r1 = convert_hdr_to_sdr(pq_file, out1, workers=1)
         r2 = convert_hdr_to_sdr(pq_file, out2, workers=2)
         assert r1.frames_processed == r2.frames_processed
+
+    def test_deterministic_two_runs_identical_bytes(self, pq_file, work_dir):
+        """需求：同输入两次一致——软编同参数两次产物逐字节相同。"""
+        out1 = os.path.join(work_dir, "run1.mp4")
+        out2 = os.path.join(work_dir, "run2.mp4")
+        convert_hdr_to_sdr(pq_file, out1, preset="medium", crf=18)
+        convert_hdr_to_sdr(pq_file, out2, preset="medium", crf=18)
+        with open(out1, "rb") as f1, open(out2, "rb") as f2:
+            assert f1.read() == f2.read()
+
+
+def _ssim_score(ref: str, other: str) -> float:
+    """用 ffmpeg ssim 滤镜计算两视频平均 SSIM（解析 stderr 汇总行）。"""
+    proc = subprocess.run(
+        [shutil.which("ffmpeg"), "-hide_banner", "-i", ref, "-i", other,
+         "-lavfi", "ssim", "-f", "null", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    # 汇总行形如：... SSIM Y:0.99... U:... V:... All:0.99... (...)
+    for line in proc.stderr.splitlines():
+        if "All:" in line:
+            token = line.split("All:")[1].split()[0]
+            # ffmpeg 可能输出 n.m 或 1.# 形式，统一转 float
+            return float(token.split("(")[0])
+    raise AssertionError(f"无法解析 SSIM:\n{proc.stderr[-500:]}")
+
+
+class TestSoftHardParity:
+    """软编与硬编共用同一 Python 引擎，画面差异只来自末端编码器。"""
+
+    @hw_available
+    @pytest.mark.parametrize("hw", _WORKING_HW)
+    def test_hardware_output_tagged_bt709(self, pq_file, work_dir, hw):
+        out = os.path.join(work_dir, f"hw_{hw}.mp4")
+        result = convert_hdr_to_sdr(pq_file, out, codec=hw)
+        assert result.tone_method  # 转换跑通
+        stream = _video_stream(out)
+        assert stream["color_transfer"] == "bt709"
+        assert stream["color_primaries"] == "bt709"
+
+    @hw_available
+    @pytest.mark.parametrize("hw", _WORKING_HW)
+    def test_soft_hard_ssim_within_tolerance(self, pq_file, work_dir, hw):
+        """同一输入软编 vs 硬编：SSIM 必须达到高相似度（编码器噪声级）。"""
+        soft = os.path.join(work_dir, "soft_ref.mp4")
+        hard = os.path.join(work_dir, f"hard_{hw}.mp4")
+        convert_hdr_to_sdr(pq_file, soft, codec="libx264", crf=18)
+        convert_hdr_to_sdr(pq_file, hard, codec=hw, crf=18)
+        score = _ssim_score(soft, hard)
+        # 同源原始帧、不同末端编码器，SSIM 应 ≥ 0.98（人眼近无损级别）
+        assert score >= 0.98, f"{hw} 与软编 SSIM={score} 超出可接受范围"
 
 
 class TestErrorPaths:
@@ -165,6 +252,12 @@ class TestErrorPaths:
             convert_hdr_to_sdr(pq_file, os.path.join(work_dir, "o.mp4"),
                                dst_bits=12)
 
+    def test_unknown_codec_rejected(self, pq_file, work_dir):
+        """编码器走白名单：任意 -c:v 名不允许透传。"""
+        with pytest.raises(ValueError):
+            convert_hdr_to_sdr(pq_file, os.path.join(work_dir, "o.mp4"),
+                               codec="not_a_real_encoder")
+
 
 class TestCmdBuilders:
     def test_decode_cmd_yuv(self, pq_file):
@@ -183,3 +276,25 @@ class TestCmdBuilders:
         assert "-color_primaries bt709" in joined
         assert "-colorspace bt709" in joined
         assert "-map_metadata -1" in joined
+
+    @pytest.mark.parametrize("hw", HARDWARE_ENCODERS)
+    def test_hardware_encode_cmd_uses_outer_vui(self, hw):
+        """硬编不发 x264/x265 私有内联参数，VUI 走外层 -color_* 标签。"""
+        cmd = build_encode_cmd(
+            "ffmpeg", "o.mp4", 160, 120, 30.0, "yuv444p16le",
+            hw, 8, "limited", "none", None, 23, "medium",
+        )
+        joined = " ".join(cmd)
+        assert "-x264-params" not in joined and "-x265-params" not in joined
+        assert "-color_trc bt709" in joined
+        assert "-map_metadata -1" in joined
+        assert cmd[cmd.index("-c:v") + 1] == hw
+
+    def test_software_encode_cmd_keeps_inline_vui(self):
+        cmd = build_encode_cmd(
+            "ffmpeg", "o.mkv", 160, 120, 30.0, "yuv444p16le",
+            "libx265", 10, "limited", "none", None, 20, "fast",
+        )
+        joined = " ".join(cmd)
+        assert "-x265-params" in joined
+        assert "colormatrix=bt709" in joined

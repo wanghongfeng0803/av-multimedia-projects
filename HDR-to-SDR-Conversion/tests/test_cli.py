@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import warnings
 
 import pytest
 
@@ -23,6 +24,7 @@ class TestParser:
         assert args.full_range is False
         assert args.assume is None
         assert args.workers == 1
+        assert args.reinhard_white == 1.0
 
     def test_flags(self):
         args = build_parser().parse_args([
@@ -34,9 +36,30 @@ class TestParser:
         assert args.ten_bit and args.full_range
         assert args.assume == "hlg" and args.workers == 4
 
+    def test_classic_reinhard_with_white(self):
+        args = build_parser().parse_args([
+            "in.mkv", "out.mp4",
+            "--tone", "reinhard_classic", "--white", "2.5",
+            "--codec", "h264_nvenc",
+        ])
+        assert args.tone == "reinhard_classic"
+        assert args.reinhard_white == 2.5
+        assert args.codec == "h264_nvenc"
+
+    def test_all_hardware_codecs_accepted(self):
+        for hw in (
+            "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf",
+        ):
+            args = build_parser().parse_args(["in.mkv", "o.mp4", "--codec", hw])
+            assert args.codec == hw
+
     def test_bad_tone_rejected(self):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["in.mkv", "o.mp4", "--tone", "nope"])
+
+    def test_bad_codec_rejected(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["in.mkv", "o.mp4", "--codec", "nope"])
 
 
 class TestCLIEndToEnd:
@@ -81,3 +104,23 @@ class TestCLIEndToEnd:
         rc = main([hlg_file, out, "--10bit", "--codec", "libx265"])
         assert rc == 0
         assert os.path.isfile(out)
+
+    def test_classic_reinhard_cli(self, pq_file, work_dir, capsys):
+        out = os.path.join(work_dir, "classic.mp4")
+        rc = main([
+            pq_file, out,
+            "--tone", "reinhard_classic", "--white", "2.0",
+        ])
+        assert rc == 0
+        assert os.path.isfile(out)
+        assert "转换完成" in capsys.readouterr().out
+
+    def test_clamp_warning_surfaces(self, pq_file, work_dir, capsys):
+        """越界白点钳制时用户应能看到提示，且转换不中断。"""
+        out = os.path.join(work_dir, "clamp.mp4")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            rc = main([pq_file, out, "--tone", "reinhard_classic",
+                       "--white", "99999"])
+        assert rc == 0
+        assert any("白点" in str(w.message) for w in caught)
