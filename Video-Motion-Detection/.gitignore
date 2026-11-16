@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# pytest
+.pytest_cache/
+
+# 本地冒烟产物
+build/
