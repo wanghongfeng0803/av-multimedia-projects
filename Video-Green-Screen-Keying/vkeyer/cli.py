@@ -88,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="软化带宽度，默认 64；0 为硬键")
     parser.add_argument("--no-despill", action="store_true",
                         help="关闭溢色抑制（默认开启，去边缘残绿/残蓝）")
+    parser.add_argument("--tolerance", type=float, default=0.0,
+                        help="容差 [0,1]，按比例放宽键色距离判定，默认 0；"
+                             "连续映射，增大时发丝等半透明边缘平滑变透而非硬切")
+    parser.add_argument("--despill-strength", type=float, default=1.0,
+                        help="溢色抑制强度 [0,1]，默认 1；0 等价于 --no-despill，"
+                             "只作用在半透明边缘，不透明前景零损伤")
     parser.add_argument("--threshold-low", type=int, default=0,
                         help="alpha 硬化下阈值，默认 0（关闭）；建议 8-16")
     parser.add_argument("--threshold-high", type=int, default=255,
@@ -131,6 +137,8 @@ def main(argv=None) -> int:
             similarity=args.similarity,
             softness=args.softness,
             despill=not args.no_despill,
+            tolerance=args.tolerance,
+            despill_strength=args.despill_strength,
             matte_config=matte,
             bg_color=args.bg_color,
             bg_image=args.bg_image,

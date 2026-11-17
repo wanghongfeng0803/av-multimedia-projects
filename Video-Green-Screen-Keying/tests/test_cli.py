@@ -58,6 +58,22 @@ def test_despill_default_on():
     assert args.no_despill is False
 
 
+def test_tolerance_and_despill_strength_defaults_neutral():
+    """两新参数默认中性：与旧版本逐像素一致的基线。"""
+    args = build_parser().parse_args(["in.mp4", "-o", "o.mov"])
+    assert args.tolerance == 0.0
+    assert args.despill_strength == 1.0
+
+
+def test_parse_tolerance_and_despill_strength():
+    args = build_parser().parse_args(
+        ["in.mp4", "-o", "o.mov",
+         "--tolerance", "0.3", "--despill-strength", "0.5"]
+    )
+    assert args.tolerance == 0.3
+    assert args.despill_strength == 0.5
+
+
 def test_mp4_alpha_returns_exit_code_9(tmp_path):
     """alpha 输出到不支持的容器时，CLI 返回 OutputFormatError 的退出码 9。
 

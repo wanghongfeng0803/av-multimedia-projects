@@ -26,8 +26,16 @@
   （对前景误入、压缩噪点、幕布阴影稳健），也可 `--key R,G,B` 显式指定。
 - **双阈值软 alpha**：RGB 欧氏距离 `d <= similarity` 全透明、
   `d >= similarity+softness` 全不透明，中间线性过渡；`softness=0` 退化为硬键。
-- **边缘不残绿（despill）**：只在半透明像素上、按 `1-alpha/255` 权重把
-  键色主导通道压到另两通道最大值；不透明像素零损伤。蓝幕自动改压蓝通道。
+- **容差（`--tolerance`，[0,1] 默认 0）**：按比例 `d·(1-t)` 放宽距离判定，
+  映射处处连续——增大时发丝等半透明边缘的 alpha 沿斜坡**平滑变透而非硬切**；
+  默认 0 与旧版本逐像素一致。
+- **边缘不残绿（despill）**：只在半透明像素上、按 `(1-alpha/255)·strength`
+  权重把键色主导通道压到另两通道最大值；不透明像素零损伤，肤色（R 主导）、
+  灰衣（无主导）等非绿前景即使在半透明边缘上也不被污染。蓝幕自动改压蓝通道。
+  力度用 `--despill-strength`（[0,1] 默认 1，与旧版逐像素一致；0 等价关闭）调节。
+- **运行中调参无脏帧**：`Keyer.update_config()` 原子换参，任意一帧要么全旧
+  要么全新；`Keyer.analyze_frame()` 对同一输入分别量化「容差影响的边缘像素数」
+  与「溢出抑制改写的像素数」（`EdgeStats`），两参数效果可独立对比。
 - **alpha 后处理三件套**（固定顺序：硬化 → choke → 羽化）：
   - 阈值硬化消灭幕布区稀疏噪点；
   - choke 取局部最小值收缩前景边缘，几何上去掉一圈幕布色；
@@ -48,6 +56,9 @@ python key.py green.mp4 -o out.mov
 
 # 蓝幕：显式键色 + 收缩 1px + 羽化 1px
 python key.py blue.mp4 -o out.mov --key 0,70,255 --choke 1 --feather 1
+
+# 调容差收幕布色差（边缘平滑变透）+ 减半溢色抑制力度
+python key.py green.mp4 -o out.mov --tolerance 0.2 --despill-strength 0.5
 
 # 矩形区域采样（归一化坐标）
 python key.py g.mp4 -o out.mov --sample-mode rect --sample-rect 0.05,0.05,0.3,0.2
@@ -92,9 +103,10 @@ pytest
 ```
 
 纯逻辑测试（键控/采样/后处理/合成，不依赖 ffmpeg）与真实 ffmpeg 集成测试
-分离；无 ffmpeg 时集成测试自动 skip。共 70+ 用例，覆盖双阈值边界、despill
-权重、choke/羽化镜像边界、合成两端精确、三种 alpha 容器、背景替换、
-音轨直通、帧数对齐、覆盖保护与失败清理。
+分离；无 ffmpeg 时集成测试自动 skip。共 90+ 用例，覆盖双阈值边界、despill
+权重、容差/强度两参数的边缘语义与默认恒等、原子换参、choke/羽化镜像边界、
+合成两端精确、三种 alpha 容器、背景替换、音轨直通、帧数对齐、覆盖保护与
+失败清理。
 
 ## 退出码
 

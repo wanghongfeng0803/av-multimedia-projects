@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import accumulate
 
-from .keyer import despill_rgb, dominant_channel
+from .keyer import despill_rgb, despill_weight, dominant_channel
 
 __all__ = [
     "MatteConfig",
@@ -218,7 +218,7 @@ def postprocess_alpha(alpha, width, height, config: MatteConfig):
 
 
 def apply_matte_to_frame(rgba, width, height, alpha, key_rgb,
-                         despill=True):
+                         despill=True, despill_strength=1.0):
     """把后处理后的 alpha 平面写回 RGBA 帧，并对新变半透明的边缘
     重新做一次 despill。
 
@@ -226,18 +226,25 @@ def apply_matte_to_frame(rgba, width, height, alpha, key_rgb,
     边缘像素的 alpha 发生变化，若不同步刷新 RGB，被 choke 救回的
     前景像素仍带着旧的抑制色。这里按新 alpha 统一重算一遍，
     保证「RGB 去色强度」与「最终 alpha」严格一致。
+
+    ``despill_strength`` 与层 1 的同名参数同义（[0, 1]，默认 1.0
+    与旧版逐像素一致），两层必须使用同一强度，否则刷新会把层 1
+    的抑制力度悄悄改写。
     """
     if len(rgba) != width * height * 4:
         raise ValueError("RGBA 帧长度与尺寸不符")
     if len(alpha) != width * height:
         raise ValueError("alpha 平面长度与尺寸不符")
+    if not 0.0 <= float(despill_strength) <= 1.0:
+        raise ValueError(f"despill_strength 必须在 [0, 1]，得到 {despill_strength!r}")
     out = bytearray(rgba)
     dom = dominant_channel(key_rgb) if despill else -1
+    strength_q = int(float(despill_strength) * 255.0 + 0.5)
     for i, a in enumerate(alpha):
         p = i * 4
         out[p + 3] = a
         if dom >= 0 and a < 255:
             r, g, b = despill_rgb(out[p], out[p + 1], out[p + 2],
-                                  dom, 255 - a)
+                                  dom, despill_weight(a, strength_q))
             out[p], out[p + 1], out[p + 2] = r, g, b
     return out

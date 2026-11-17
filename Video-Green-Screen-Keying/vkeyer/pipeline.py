@@ -121,6 +121,7 @@ def _background_decoder(ffmpeg, bg_path, width, height):
 def key_video(src, dst, *, key_rgb=None, sample_mode=DEFAULT_REGION,
               sample_rect=None, sample_frames=DEFAULT_SAMPLE_FRAMES,
               similarity=32.0, softness=64.0, despill=True,
+              tolerance=0.0, despill_strength=1.0,
               matte_config=None, bg_color=None, bg_image=None,
               overwrite=False, progress=None):
     """对 ``src`` 做色度键抠像，结果写入 ``dst``，音轨原样保留。
@@ -134,6 +135,12 @@ def key_video(src, dst, *, key_rgb=None, sample_mode=DEFAULT_REGION,
         双阈值键控参数，含义见 :class:`vkeyer.keyer.KeyerConfig`。
     despill:
         是否启用溢色抑制（层1 与层2 刷新各一次，同权重）。
+    tolerance:
+        容差 [0, 1]，按比例放宽距离判定；默认 0 与旧版一致。
+        连续映射，增大时半透明边缘平滑变透而非硬切。
+    despill_strength:
+        溢色抑制强度 [0, 1]，默认 1 与旧版一致；层1 与层2 刷新
+        共用同一强度。
     matte_config:
         层2 参数 :class:`MatteConfig`；None 取恒等默认（不后处理）。
     bg_color / bg_image:
@@ -200,6 +207,7 @@ def key_video(src, dst, *, key_rgb=None, sample_mode=DEFAULT_REGION,
     keyer = Keyer(KeyerConfig(
         key_rgb=key_rgb, similarity=similarity,
         softness=softness, despill=despill,
+        tolerance=tolerance, despill_strength=despill_strength,
     ))
     if matte_config is None:
         matte_config = MatteConfig()
@@ -254,7 +262,8 @@ def key_video(src, dst, *, key_rgb=None, sample_mode=DEFAULT_REGION,
             if not matte_config.is_identity:
                 alpha = postprocess_alpha(rgba[3::4], w, h, matte_config)
                 rgba = apply_matte_to_frame(
-                    rgba, w, h, alpha, key_rgb, despill=despill
+                    rgba, w, h, alpha, key_rgb, despill=despill,
+                    despill_strength=despill_strength,
                 )
             # 层3：背景替换或直出 alpha
             if composite_mode:

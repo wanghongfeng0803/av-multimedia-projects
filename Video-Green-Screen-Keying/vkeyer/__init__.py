@@ -16,9 +16,11 @@
 
 from .keyer import (
     MAX_DISTANCE,
+    EdgeStats,
     Keyer,
     KeyerConfig,
     despill_rgb,
+    despill_weight,
     dominant_channel,
 )
 from .sampler import (
@@ -67,9 +69,11 @@ from .errors import (
 __all__ = [
     # 层1：键控
     "MAX_DISTANCE",
+    "EdgeStats",
     "Keyer",
     "KeyerConfig",
     "despill_rgb",
+    "despill_weight",
     "dominant_channel",
     # 层1：采样
     "DEFAULT_REGION",
