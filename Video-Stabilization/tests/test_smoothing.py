@@ -7,7 +7,9 @@ import pytest
 from stabilize.smoothing import (
     DEFAULT_RADIUS,
     accumulate_trajectory,
+    clamp_compensation,
     compute_crop,
+    dynamic_insets,
     gaussian_weights,
     interpolate_invalid,
     moving_average,
@@ -125,6 +127,89 @@ def test_compute_crop_clamps_to_short_side_ratio():
     )
     assert crop["clamped"] is True
     assert crop["inset"] == pytest.approx(45.0, abs=0.01)
+
+
+# ----------------------------------------------------- 补偿量限幅
+
+def test_clamp_compensation_hard_limits():
+    cx, cy, ca, stats = clamp_compensation(
+        [0.0, 5.0, -7.0], [1.0, -1.0, 0.5], [0.0, 3.0, -3.0],
+        max_shift=4.0, max_angle=2.0,
+    )
+    assert cx == [0.0, 4.0, -4.0]
+    assert cy == [1.0, -1.0, 0.5]          # 未超限时逐值保留
+    assert ca == [0.0, 2.0, -2.0]
+    assert stats["clamped_frames"] == 2    # 第 1、2 帧任一分量被夹
+    assert stats["shift_frames"] == 2
+    assert stats["angle_frames"] == 2
+    assert stats["raw_peak"]["dx"] == 7.0  # 限幅前峰值保留供对比
+    assert stats["peak"]["dx"] == 4.0
+    assert stats["peak"]["angle"] == 2.0
+
+
+def test_clamp_compensation_none_passthrough():
+    cx, cy, ca, stats = clamp_compensation([9.0], [-9.0], [9.0])
+    assert cx == [9.0] and cy == [-9.0] and ca == [9.0]
+    assert stats["clamped_frames"] == 0
+    assert stats["peak"]["dx"] == 9.0
+
+
+def test_clamp_compensation_rejects_negative_limit():
+    with pytest.raises(ValueError):
+        clamp_compensation([0.0], [0.0], [0.0], max_shift=-1.0)
+    with pytest.raises(ValueError):
+        clamp_compensation([0.0], [0.0], [0.0], max_angle=-0.5)
+
+
+def test_smooth_motion_limits_leave_smoothing_untouched():
+    # 限幅与平滑不打架：smoothed/trajectory 与不限幅逐帧一致，
+    # 限幅只截断最终补偿信号，平滑器看不到被夹的值
+    doc = _motion_doc()
+    plain = smooth_motion(doc, radius=3)
+    limited = smooth_motion(doc, radius=3, max_shift=2.0, max_angle=0.5)
+    assert "limits" not in plain           # 旧模式 JSON 无 limits 段
+    assert "limits" in limited
+    for fp, fl in zip(plain["frames"], limited["frames"]):
+        assert fp["smoothed"] == fl["smoothed"]
+        assert fp["trajectory"] == fl["trajectory"]
+        # 帧条目契约不变（与旧模式同 schema）
+        assert set(fl) == {"index", "trajectory", "smoothed",
+                           "compensation", "valid"}
+    lim = limited["limits"]
+    assert lim["max_shift"] == 2.0 and lim["max_angle"] == 0.5
+    assert lim["clamped_frames"] > 0
+    for f in limited["frames"]:
+        assert abs(f["compensation"]["dx"]) <= 2.0 + 1e-4
+        assert abs(f["compensation"]["dy"]) <= 2.0 + 1e-4
+        assert abs(f["compensation"]["angle"]) <= 0.5 + 1e-4
+    # 裁剪量由限幅后补偿推导：只减不增
+    assert limited["crop"]["inset"] <= plain["crop"]["inset"] + 1e-9
+    # 限幅前后峰值都记录，可直接对比两种模式
+    assert lim["raw_peak"]["dx"] >= lim["peak"]["dx"]
+
+
+# ----------------------------------------------------- 动态裁剪 inset
+
+def test_dynamic_insets_constant_compensation():
+    ins = dynamic_insets(200, 100, [3.0] * 9, [0.0] * 9, [0.0] * 9,
+                         radius=2)
+    assert len(ins) == 9
+    # 常数补偿 → 常数 inset（边界截断重新归一化，不向零塌陷）
+    assert all(v == ins[0] for v in ins)
+    assert ins[0] >= 3 + 1                 # 补偿 + 安全余量
+
+
+def test_dynamic_insets_smoothes_breathing():
+    # 单帧尖峰被滑动平均摊薄：峰值 inset 远小于瞬时需求（防呼吸）
+    comp = [0.0] * 5 + [20.0] + [0.0] * 5
+    ins = dynamic_insets(400, 300, comp, [0.0] * 11, [0.0] * 11, radius=2)
+    assert 0 < max(ins) < 20 + 1
+
+
+def test_dynamic_insets_cover_rotation():
+    no_rot = dynamic_insets(200, 100, [0.0] * 5, [0.0] * 5, [0.0] * 5)
+    with_rot = dynamic_insets(200, 100, [0.0] * 5, [0.0] * 5, [5.0] * 5)
+    assert all(r > n for r, n in zip(with_rot, no_rot))
 
 
 # ----------------------------------------------------- 端到端纯函数

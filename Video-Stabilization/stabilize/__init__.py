@@ -44,7 +44,9 @@ from .smoothing import (
     DEFAULT_RADIUS,
     MAX_CROP_RATIO,
     accumulate_trajectory,
+    clamp_compensation,
     compute_crop,
+    dynamic_insets,
     gaussian_weights,
     interpolate_invalid,
     moving_average,
@@ -63,10 +65,14 @@ from .pipeline import (
     probe,
 )
 from .compensate import (
+    BORDER_MODES,
     DEFAULT_CRF,
     build_sendcmd,
+    build_sendcmd_dynamic,
+    build_sendcmd_mirror,
     compensate_video,
     crop_video,
+    mirror_margin,
 )
 
 __all__ = [
@@ -80,10 +86,12 @@ __all__ = [
     "DEFAULT_RADIUS", "MAX_CROP_RATIO", "CROP_SAFETY_PX",
     "interpolate_invalid", "accumulate_trajectory", "moving_average",
     "gaussian_weights", "smooth_trajectory", "rotation_inset",
-    "compute_crop", "smooth_motion",
+    "compute_crop", "clamp_compensation", "dynamic_insets", "smooth_motion",
     # pipeline
     "MOTION_FORMAT", "SMOOTH_FORMAT", "PipelineError",
     "probe", "fps_to_float", "estimate_motion", "load_json", "dump_json",
     # compensate
-    "DEFAULT_CRF", "build_sendcmd", "compensate_video", "crop_video",
+    "DEFAULT_CRF", "BORDER_MODES",
+    "build_sendcmd", "build_sendcmd_dynamic", "build_sendcmd_mirror",
+    "mirror_margin", "compensate_video", "crop_video",
 ]

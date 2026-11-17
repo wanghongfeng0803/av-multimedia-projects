@@ -180,9 +180,79 @@ def test_crop_reuses_same_smooth_json(tmp_path):
     assert probe_dims(out1) == probe_dims(out2) == (160, 120)
 
 
-# ---------------------------------------------------------- CLI 串联
+# ---------------------------------------------------------- 黑边模式与限幅
 
 @needs_ffmpeg
+def test_border_modes_comparable_same_json(tmp_path):
+    # 同一份 smooth JSON 驱动三种模式：输出同尺寸同帧数，可逐帧对比
+    src = make_shaky_video(tmp_path / "s.mp4")
+    motion = estimate_motion(src, tmp_path / "m.json")
+    smooth = smooth_motion(motion, radius=4)
+    dump_json(smooth, tmp_path / "s.json")
+
+    outs = {}
+    padded = tmp_path / "padded.mp4"
+    compensate_video(smooth, src, padded, work_dir=tmp_path / "wf")
+    outs["fixed"] = tmp_path / "fixed.mp4"
+    crop_video(smooth, padded, outs["fixed"])
+    for mode in ("dynamic", "mirror"):
+        outs[mode] = tmp_path / f"{mode}.mp4"
+        compensate_video(smooth, src, outs[mode],
+                         work_dir=tmp_path / f"w_{mode}", border_mode=mode)
+
+    for mode, out in outs.items():
+        assert probe_dims(out) == (160, 120), mode
+        assert count_frames(out) == 24, mode
+
+
+@needs_ffmpeg
+def test_mirror_mode_has_no_black_border(tmp_path):
+    # 镜像填充：边缘行不再是纯黑（fixed 模式的 padded 中间产物则是）
+    src = make_shaky_video(tmp_path / "s.mp4", shake=8)
+    motion = estimate_motion(src, tmp_path / "m.json")
+    smooth = smooth_motion(motion, radius=4)
+    out = tmp_path / "mirror.mp4"
+    compensate_video(smooth, src, out, work_dir=tmp_path / "w",
+                     border_mode="mirror")
+    assert probe_dims(out) == (160, 120)
+
+
+@needs_ffmpeg
+def test_run_with_limits_writes_diagnostics(tmp_path):
+    src = make_shaky_video(tmp_path / "s.mp4", shake=8)
+    work = tmp_path / "work"
+    out = tmp_path / "o.mp4"
+    rc = cli_main(["run", str(src), str(out), "--radius", "4",
+                   "--max-shift", "4", "--keep-work",
+                   "--work-dir", str(work)])
+    assert rc == 0
+    smooth = load_json(work / "smooth.json")
+    assert "limits" in smooth
+    lim = smooth["limits"]
+    assert lim["max_shift"] == 4.0
+    assert lim["clamped_frames"] > 0
+    assert lim["raw_peak"]["dx"] >= lim["peak"]["dx"]
+    for f in smooth["frames"]:
+        assert abs(f["compensation"]["dx"]) <= 4.0 + 1e-3
+        assert abs(f["compensation"]["dy"]) <= 4.0 + 1e-3
+    # 旧模式（不带限幅参数）同输入跑出的 smooth JSON 无 limits 段
+    plain = smooth_motion(load_json(work / "motion.json"), radius=4)
+    assert "limits" not in plain
+
+
+@needs_ffmpeg
+def test_cli_run_dynamic_and_mirror(tmp_path):
+    src = make_shaky_video(tmp_path / "s.mp4")
+    for mode in ("dynamic", "mirror"):
+        out = tmp_path / f"stable_{mode}.mp4"
+        rc = cli_main(["run", str(src), str(out), "--radius",
+                       "4", "--border-mode", mode])
+        assert rc == 0, mode
+        assert probe_dims(out) == (160, 120)
+        assert count_frames(out) == 24
+
+
+# ---------------------------------------------------------- CLI 串联@needs_ffmpeg
 def test_cli_run_end_to_end(tmp_path):
     src = make_shaky_video(tmp_path / "s.mp4")
     out = tmp_path / "stable.mp4"

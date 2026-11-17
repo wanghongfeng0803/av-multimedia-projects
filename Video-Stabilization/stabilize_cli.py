@@ -5,7 +5,9 @@
     python stabilize.py estimate  输入 运动.json [--est-width 96]
     python stabilize.py smooth    运动.json 平滑.json [--radius 15]
                                              [--method uniform|gaussian]
+                                             [--max-shift 像素] [--max-angle 度]
     python stabilize.py compensate 输入 平滑.json 稳定带黑边.mp4
+                                  [--border-mode fixed|dynamic|mirror]
                                   [--work-dir 目录] [--crf 18]
     python stabilize.py crop      稳定带黑边.mp4 平滑.json 输出.mp4
                                   [--inset 像素]
@@ -18,6 +20,11 @@
 - 平移与旋转在 JSON 中始终是独立字段，补偿阶段也走两个独立滤镜；
 - 估计/平滑/补偿解耦：同一份平滑 JSON 可反复用于不同裁剪量，
   裁剪步骤不重新估计；
+- 黑边三模式（fixed/dynamic/mirror）是补偿期参数，不进 JSON：
+  同一份 smooth JSON 可产出三种模式结果，输出同尺寸同帧率，
+  可直接逐帧对比；fixed 为默认旧行为；
+- 补偿限幅（--max-shift/--max-angle）在平滑之后作用于补偿信号，
+  默认关闭（旧行为），开启后 JSON 带 limits 诊断段供对比；
 - 零三方依赖，ffmpeg/ffprobe 走子进程。
 
 退出码：0 成功；1 通用失败；2 参数/契约错误；8 ffmpeg 流水线失败。
@@ -29,6 +36,7 @@ import sys
 import tempfile
 
 from stabilize import (
+    BORDER_MODES,
     DEFAULT_CRF,
     DEFAULT_RADIUS,
     EST_WIDTH,
@@ -78,7 +86,8 @@ def cmd_smooth(args):
         print(f"参数文件格式不符：需要 {MOTION_FORMAT}，"
               f"收到 {motion.get('format')!r}", file=sys.stderr)
         return EXIT_ARGS
-    doc = smooth_motion(motion, radius=args.radius, method=args.method)
+    doc = smooth_motion(motion, radius=args.radius, method=args.method,
+                        max_shift=args.max_shift, max_angle=args.max_angle)
     dump_json(doc, args.smooth_json)
     crop = doc["crop"]
     warn = "（触发上限钳制）" if crop["clamped"] else ""
@@ -88,6 +97,15 @@ def cmd_smooth(args):
     print(f"推荐裁剪 inset={crop['inset']}px{warn}："
           f"平移峰值 x={crop['max_shift_x']} y={crop['max_shift_y']}，"
           f"旋转峰值 {crop['max_angle']}°")
+    limits = doc.get("limits")
+    if limits:
+        raw, peak = limits["raw_peak"], limits["peak"]
+        print(f"补偿限幅：平移 ±{limits['max_shift']}px "
+              f"旋转 ±{limits['max_angle']}°，"
+              f"被限幅 {limits['clamped_frames']} 帧；"
+              f"限幅前峰值 dx={raw['dx']} dy={raw['dy']} "
+              f"angle={raw['angle']}，限幅后 dx={peak['dx']} "
+              f"dy={peak['dy']} angle={peak['angle']}")
     return EXIT_OK
 
 
@@ -99,10 +117,16 @@ def cmd_compensate(args):
         return EXIT_ARGS
     info = compensate_video(
         doc, args.input, args.output, work_dir=args.work_dir,
-        crf=args.crf, progress=_progress("已补偿"),
+        crf=args.crf, border_mode=args.border_mode,
+        progress=_progress("已补偿"),
     )
-    print(f"\n完成：{info['frames']} 帧补偿（含待裁黑边），"
-          f"命令文件 {info['sendcmd']} -> {args.output}")
+    if info["final"]:
+        print(f"\n完成：{info['frames']} 帧补偿（{args.border_mode} 模式，"
+              f"输出已为成品，无需 crop 步骤），"
+              f"命令文件 {info['sendcmd']} -> {args.output}")
+    else:
+        print(f"\n完成：{info['frames']} 帧补偿（含待裁黑边），"
+              f"命令文件 {info['sendcmd']} -> {args.output}")
     return EXIT_OK
 
 
@@ -141,21 +165,36 @@ def cmd_run(args):
         )
         print()
         smoothed = smooth_motion(motion, radius=args.radius,
-                                 method=args.method)
+                                 method=args.method,
+                                 max_shift=args.max_shift,
+                                 max_angle=args.max_angle)
         dump_json(smoothed, smooth_path)
-        compensate_video(smoothed, args.input, stabilized,
-                         work_dir=work, crf=args.crf,
-                         progress=_progress("已补偿"))
-        print()
-        crop_video(smoothed, stabilized, args.output, crf=args.crf)
+        if args.border_mode == "fixed":
+            # 旧流程：补偿出带黑边视频，再裁剪缩回原尺寸
+            compensate_video(smoothed, args.input, stabilized,
+                             work_dir=work, crf=args.crf,
+                             border_mode="fixed",
+                             progress=_progress("已补偿"))
+            print()
+            crop_video(smoothed, stabilized, args.output, crf=args.crf)
+        else:
+            # dynamic/mirror：补偿输出即成品，直接写到目标路径
+            compensate_video(smoothed, args.input, args.output,
+                             work_dir=work, crf=args.crf,
+                             border_mode=args.border_mode,
+                             progress=_progress("已补偿"))
+            print()
     finally:
         if cleanup:
             import shutil
             shutil.rmtree(work, ignore_errors=True)
-    print(f"完成：{args.input} -> {args.output}")
+    print(f"完成：{args.input} -> {args.output}"
+          f"（黑边模式 {args.border_mode}）")
     if not cleanup:
-        print(f"中间产物保留在 {work}（motion.json / smooth.json / "
-              f"stabilized_padded.mp4）")
+        kept = "motion.json / smooth.json"
+        if args.border_mode == "fixed":
+            kept += " / stabilized_padded.mp4"
+        print(f"中间产物保留在 {work}（{kept}）")
     return EXIT_OK
 
 
@@ -181,6 +220,10 @@ def build_parser():
     p_sm.add_argument("--method", choices=["uniform", "gaussian"],
                       default="uniform", help="uniform 均匀窗（默认）/ "
                                               "gaussian 高斯加权窗")
+    p_sm.add_argument("--max-shift", type=float, default=None,
+                      help="补偿平移限幅（像素），防过冲；默认不限幅（旧行为）")
+    p_sm.add_argument("--max-angle", type=float, default=None,
+                      help="补偿旋转限幅（度）；默认不限幅（旧行为）")
     p_sm.set_defaults(func=cmd_smooth)
 
     p_cp = sub.add_parser("compensate", help="按 smooth JSON 做旋转/平移补偿")
@@ -191,6 +234,10 @@ def build_parser():
                       help="sendcmd 临时目录，默认 ./stabilize_work")
     p_cp.add_argument("--crf", type=int, default=DEFAULT_CRF,
                       help=f"x264 质量，默认 {DEFAULT_CRF}")
+    p_cp.add_argument("--border-mode", choices=BORDER_MODES, default="fixed",
+                      help="黑边处理：fixed 固定裁剪（默认，需再接 crop）/ "
+                           "dynamic 逐帧动态裁剪（输出即成品）/ "
+                           "mirror 镜像填充（输出即成品）")
     p_cp.set_defaults(func=cmd_compensate)
 
     p_cr = sub.add_parser("crop", help="复用 smooth JSON 裁掉黑边并缩回原尺寸")
@@ -210,6 +257,13 @@ def build_parser():
     p_run.add_argument("--radius", type=int, default=DEFAULT_RADIUS)
     p_run.add_argument("--method", choices=["uniform", "gaussian"],
                        default="uniform")
+    p_run.add_argument("--max-shift", type=float, default=None,
+                       help="补偿平移限幅（像素），默认不限幅（旧行为）")
+    p_run.add_argument("--max-angle", type=float, default=None,
+                       help="补偿旋转限幅（度），默认不限幅（旧行为）")
+    p_run.add_argument("--border-mode", choices=BORDER_MODES, default="fixed",
+                       help="黑边处理：fixed 固定裁剪（默认）/ "
+                            "dynamic 逐帧动态裁剪 / mirror 镜像填充")
     p_run.add_argument("--crf", type=int, default=DEFAULT_CRF)
     p_run.add_argument("--keep-work", action="store_true",
                        help="保留中间 JSON 与带黑边视频（默认临时目录自动清理）")

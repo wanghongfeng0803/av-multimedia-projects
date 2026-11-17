@@ -1,10 +1,20 @@
 """sendcmd 生成与参数钳制的纯逻辑测试（不跑 ffmpeg）。"""
 
 import math
+import subprocess
+import types
 
 import pytest
 
-from stabilize.compensate import build_sendcmd, crop_video
+from stabilize.compensate import (
+    BORDER_MODES,
+    build_sendcmd,
+    build_sendcmd_dynamic,
+    build_sendcmd_mirror,
+    compensate_video,
+    crop_video,
+    mirror_margin,
+)
 from stabilize.pipeline import PipelineError
 
 
@@ -92,3 +102,139 @@ def test_crop_video_clamps_inset_before_ffmpeg(tmp_path, monkeypatch):
     with pytest.raises(pytest.fail.Exception):
         crop_video(doc, tmp_path / "in.mp4", tmp_path / "out.mp4",
                    inset=1000.0)
+
+
+# ----------------------------------------------------- 动态裁剪模式
+
+def test_dynamic_sendcmd_has_per_frame_window(tmp_path):
+    doc = _smooth_doc()  # 120x80，5 帧
+    path = build_sendcmd_dynamic(doc, str(tmp_path / "d.cmd"),
+                                 [4, 5, 6, 6, 5])
+    text = open(path, encoding="utf-8").read()
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    assert len(lines) == 5
+    # 第 2 行（inset=5）：窗口 110x70，逐帧下发 w/h/x/y 四参数
+    assert "crop@cp w 110" in lines[1]
+    assert "crop@cp h 70" in lines[1]
+    assert "crop@cp x min(max(" in lines[1]
+    assert "rotate@st angle" in lines[1]
+    # 第 3 行（inset=6）：窗口 108x68
+    assert "crop@cp w 108" in lines[2]
+
+
+def test_dynamic_sendcmd_rejects_length_mismatch(tmp_path):
+    doc = _smooth_doc()
+    with pytest.raises(PipelineError):
+        build_sendcmd_dynamic(doc, str(tmp_path / "d.cmd"), [4, 4])
+
+
+def test_dynamic_sendcmd_rejects_oversized_inset(tmp_path):
+    doc = _smooth_doc()
+    with pytest.raises(PipelineError):
+        build_sendcmd_dynamic(doc, str(tmp_path / "d.cmd"),
+                              [4, 4, 50, 4, 4])  # 短边 80，剩余高度 < 2
+
+
+# ----------------------------------------------------- 镜像填充模式
+
+def test_mirror_margin_covers_raw_inset():
+    doc = _smooth_doc()  # crop: raw_inset=6, max_angle=2.0
+    m = mirror_margin(doc)
+    # 2° 时放大系数 1/(1-s-c)≈1.037：ceil(6×1.037)+1 = 8
+    assert m == 8
+    assert m >= doc["crop"]["raw_inset"]
+
+
+def test_mirror_margin_rejects_extreme_angle():
+    doc = _smooth_doc()
+    doc["crop"]["max_angle"] = 60.0
+    with pytest.raises(PipelineError):
+        mirror_margin(doc)
+
+
+def test_mirror_sendcmd_full_frame_window(tmp_path):
+    doc = _smooth_doc()
+    path = build_sendcmd_mirror(doc, str(tmp_path / "m.cmd"), margin=10)
+    text = open(path, encoding="utf-8").read()
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    assert len(lines) == 5
+    # 窗口恒为原画幅：不下发 w/h，只下发原点
+    assert "crop@cp w" not in text
+    # 帧 0 补偿 dx=-2 → 原点 x = 10-(-2) = 12；dy=2 → 原点 y = 8
+    assert "crop@cp x min(max(12.000000" in lines[0]
+    assert "crop@cp y min(max(8.000000" in lines[0]
+    # 原点钳制上界 = 2×margin
+    assert "\\,20)" in lines[0]
+
+
+# ----------------------------------------------------- 滤镜链分发
+
+def _capture_ffmpeg(monkeypatch):
+    """替换 _find 与 subprocess.run，返回捕获命令行的 dict。"""
+    captured = {}
+    monkeypatch.setattr("stabilize.compensate._find", lambda tool: tool)
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return captured
+
+
+def _vf_of(captured):
+    cmd = captured["cmd"]
+    return cmd[cmd.index("-vf") + 1]
+
+
+def test_compensate_fixed_mode_chain_unchanged(tmp_path, monkeypatch):
+    captured = _capture_ffmpeg(monkeypatch)
+    doc = _smooth_doc()
+    info = compensate_video(doc, "in.mp4", tmp_path / "o.mp4",
+                            work_dir=str(tmp_path / "w"))
+    vf = _vf_of(captured)
+    # 旧行为回归：rotate + 小框 crop + pad 回原画幅
+    assert "rotate@st=" in vf and "crop@cp=108:68" in vf
+    assert "pad=120:80" in vf
+    assert "fillborders" not in vf and "scale=" not in vf
+    assert info["border_mode"] == "fixed" and info["final"] is False
+
+
+def test_compensate_dynamic_mode_chain(tmp_path, monkeypatch):
+    captured = _capture_ffmpeg(monkeypatch)
+    doc = _smooth_doc()
+    info = compensate_video(doc, "in.mp4", tmp_path / "o.mp4",
+                            work_dir=str(tmp_path / "w"),
+                            border_mode="dynamic")
+    vf = _vf_of(captured)
+    # 逐帧窗口 + 帧内缩回原尺寸，无 pad（无黑边）
+    assert "crop@cp=" in vf
+    assert "scale=120:80" in vf and "eval=frame" in vf
+    assert "pad=" not in vf and "fillborders" not in vf
+    assert info["final"] is True
+    # sendcmd 副本含逐帧 w/h 命令
+    text = open(info["sendcmd"], encoding="utf-8").read()
+    assert "crop@cp w " in text
+
+
+def test_compensate_mirror_mode_chain(tmp_path, monkeypatch):
+    captured = _capture_ffmpeg(monkeypatch)
+    doc = _smooth_doc()
+    info = compensate_video(doc, "in.mp4", tmp_path / "o.mp4",
+                            work_dir=str(tmp_path / "w"),
+                            border_mode="mirror")
+    vf = _vf_of(captured)
+    # 先镜像扩边再补偿，窗口恒为原画幅，无 pad/scale
+    assert vf.startswith("fillborders=8:8:8:8:mode=mirror")
+    assert "crop@cp=120:80" in vf
+    assert "pad=" not in vf and "scale=" not in vf
+    assert info["final"] is True
+
+
+def test_compensate_rejects_unknown_mode(tmp_path):
+    doc = _smooth_doc()
+    with pytest.raises(PipelineError):
+        compensate_video(doc, "in.mp4", tmp_path / "o.mp4",
+                         work_dir=str(tmp_path / "w"),
+                         border_mode="bogus")
+    assert "bogus" not in BORDER_MODES

@@ -13,9 +13,14 @@ smooth JSON（补偿与裁剪两个后续步骤共用，裁剪不再重新估计
    补偿量 = 平滑轨迹 − 原始轨迹。
 3. **时域平滑**：默认居中均匀滑动平均（窗口 2r+1，边界截断），
    可选高斯窗（σ 与窗口半径挂钩）。平滑只作用于累积轨迹。
-4. **裁剪量推导**：逐帧补偿位移取各方向最大值，旋转角取全片
+4. **补偿量限幅**（可选）：补偿量 = 平滑轨迹 − 原始轨迹，硬限幅
+   只截断该最终信号的幅值。限幅发生在平滑**完成之后**，平滑器
+   永远看不到被夹的值，二者无反馈回路、互不打架；硬限幅只让
+   速度出现折点，位置信号保持连续，不引入新的高频抖动。
+5. **裁剪量推导**：逐帧补偿位移取各方向最大值，旋转角取全片
    最大绝对值按角点轨迹折算，加 1px 安全余量，统一四边 inset；
-   同时做下限（0）与上限（不超过短边 45%）钳制。
+   同时做下限（0）与上限（不超过短边 45%）钳制。限幅开启时
+   裁剪量由限幅后的补偿推导，限幅直接降低裁剪量。
 """
 
 import math
@@ -32,6 +37,8 @@ __all__ = [
     "smooth_trajectory",
     "rotation_inset",
     "compute_crop",
+    "clamp_compensation",
+    "dynamic_insets",
     "smooth_motion",
 ]
 
@@ -195,8 +202,91 @@ def compute_crop(width, height, comp_x, comp_y, comp_a,
     }
 
 
+def clamp_compensation(comp_x, comp_y, comp_a,
+                       max_shift=None, max_angle=None):
+    """补偿量硬限幅：超出 ±limit 的分量夹回边界，防止过冲与抖动放大。
+
+    调用时机固定在平滑完成之后（见 :func:`smooth_motion`）：平滑器
+    看不到被夹的值，限幅也不回改轨迹，两者无反馈回路。硬限幅只
+    让补偿信号的速度出现折点，位置保持连续，不会引入新的抖动。
+
+    ``max_shift``（像素）同时约束 dx/dy，``max_angle``（度）约束
+    旋转；``None`` 表示该分量直通（旧行为）。负值抛 ValueError。
+
+    返回 ``(cx, cy, ca, stats)``；``stats`` 记录限幅前后峰值与
+    被夹帧数，写入 smooth JSON 的 ``limits`` 段，供限幅模式与
+    旧模式对比::
+
+        {"clamped_frames": 任一分量被夹的帧数,
+         "shift_frames": int, "angle_frames": int,
+         "raw_peak": {"dx","dy","angle"},   # 限幅前峰值
+         "peak": {"dx","dy","angle"}}       # 限幅后峰值
+    """
+    for name, limit in (("max_shift", max_shift), ("max_angle", max_angle)):
+        if limit is not None and limit < 0:
+            raise ValueError(f"{name} 不能为负")
+
+    def _peak(seq):
+        return max((abs(v) for v in seq), default=0.0)
+
+    raw_peak = {"dx": _peak(comp_x), "dy": _peak(comp_y),
+                "angle": _peak(comp_a)}
+
+    def _clamp(seq, limit):
+        if limit is None:
+            return [float(v) for v in seq], set()
+        lo, hi = -float(limit), float(limit)
+        out, hits = [], set()
+        for i, v in enumerate(seq):
+            if v > hi:
+                out.append(hi)
+                hits.add(i)
+            elif v < lo:
+                out.append(lo)
+                hits.add(i)
+            else:
+                out.append(float(v))
+        return out, hits
+
+    cx, hx = _clamp(comp_x, max_shift)
+    cy, hy = _clamp(comp_y, max_shift)
+    ca, ha = _clamp(comp_a, max_angle)
+    shift_hits = hx | hy
+    stats = {
+        "clamped_frames": len(shift_hits | ha),
+        "shift_frames": len(shift_hits),
+        "angle_frames": len(ha),
+        "raw_peak": {k: round(v, 4) for k, v in raw_peak.items()},
+        "peak": {
+            "dx": round(_peak(cx), 4),
+            "dy": round(_peak(cy), 4),
+            "angle": round(_peak(ca), 4),
+        },
+    }
+    return cx, cy, ca, stats
+
+
+def dynamic_insets(width, height, comp_x, comp_y, comp_a,
+                   radius=DEFAULT_RADIUS):
+    """逐帧最小安全 inset（动态裁剪模式用），时域平滑后上取整。
+
+    每帧需求 = ``max(|cx|, |cy|) + 该帧旋转角折算 inset + 安全余量``；
+    再按 ``radius`` 做居中滑动平均——逐帧缩放比若随补偿量瞬时跳动，
+    画面会出现「呼吸」伪影，平滑把缩放比变化摊到窗口尺度上；最后
+    向上取整为整数像素并按短边 45% 上限钳制。返回等长 int list。
+    """
+    need = [
+        max(abs(cx), abs(cy)) + rotation_inset(width, height, ca)
+        + CROP_SAFETY_PX
+        for cx, cy, ca in zip(comp_x, comp_y, comp_a)
+    ]
+    smoothed = moving_average(need, radius)
+    cap = int(min(width, height) * MAX_CROP_RATIO)
+    return [min(int(math.ceil(v)), cap) for v in smoothed]
+
+
 def smooth_motion(motion_doc, radius=DEFAULT_RADIUS, method="uniform",
-                  scale=1.0):
+                  scale=1.0, max_shift=None, max_angle=None):
     """估计 JSON → 平滑 JSON 的完整第二步（纯函数，便于单测）。
 
     输入为 :func:`stabilize.pipeline.estimate_motion` 写出的 dict，
@@ -204,7 +294,12 @@ def smooth_motion(motion_doc, radius=DEFAULT_RADIUS, method="uniform",
 
     - ``frames``：每帧平滑轨迹与补偿量（原分辨率，已乘缩放比）；
     - ``crop``：统一四边 inset 与诊断字段；
-    - ``params``：平滑参数与无效帧统计。
+    - ``params``：平滑参数与无效帧统计；
+    - ``limits``（仅限幅开启时）：限幅阈值、被夹帧数、限幅前后
+      峰值，供限幅模式与旧（不限幅）模式对比。
+
+    ``max_shift``/``max_angle`` 为 ``None``（默认）时行为与旧版
+    完全一致：不限幅、JSON 无 ``limits`` 段。
     """
     src = motion_doc
     frames_in = src["frames"]
@@ -234,6 +329,15 @@ def smooth_motion(motion_doc, radius=DEFAULT_RADIUS, method="uniform",
     comp_y = [s - r for s, r in zip(sm_y, tra_y)]
     comp_a = [s - r for s, r in zip(sm_a, tra_a)]
 
+    # 限幅在平滑之后、裁剪推导之前：平滑器看不到被夹的值，
+    # 裁剪量由限幅后的补偿推导（限幅直接降低裁剪量）
+    limits = None
+    if max_shift is not None or max_angle is not None:
+        comp_x, comp_y, comp_a, stat = clamp_compensation(
+            comp_x, comp_y, comp_a, max_shift, max_angle
+        )
+        limits = {"max_shift": max_shift, "max_angle": max_angle, **stat}
+
     out_frames = [
         {
             "index": t,
@@ -257,7 +361,7 @@ def smooth_motion(motion_doc, radius=DEFAULT_RADIUS, method="uniform",
         for t in range(n)
     ]
     crop = compute_crop(width, height, comp_x, comp_y, comp_a, scale)
-    return {
+    out = {
         "format": "stabilize-smooth",
         "version": 1,
         "source": src.get("source"),
@@ -273,3 +377,6 @@ def smooth_motion(motion_doc, radius=DEFAULT_RADIUS, method="uniform",
             "invalid_frames": n - sum(valid),
         },
     }
+    if limits is not None:
+        out["limits"] = limits
+    return out
