@@ -4,6 +4,7 @@
 完整转换（一条命令跑完三步，抽帧产物落在临时目录）::
 
     python gif_convert.py 输入视频 输出.gif [--fps 12] [--max-width 480]
+                          [--width W --height H] [--align-odd]
                           [--colors 256] [--work-dir DIR] [--no-reuse]
                           [--indexed-scale]
 
@@ -12,6 +13,12 @@
     python gif_convert.py extract  输入视频 工作目录
     python gif_convert.py quantize 工作目录 索引产物.pkl --fps 12 ...
     python gif_convert.py encode   索引产物.pkl 输出.gif
+
+缩放规则：缩放严格接在抽帧之后、量化之前，调色板基于最终尺寸生成；
+缩小走面积平均抗锯齿、放大走双线性（RGB 域）。显式 --width/--height
+按源宽高比等比缩放（只给一个维度时另一个自动推导，同时给出且比例
+不符直接报错，不拉伸画面）；--align-odd 把宽高各自规整到最近奇数，
+宽高比与奇数对齐冲突时宽高比优先（先等比取整再 ±1px，不拉伸）。
 
 时序保证：GIF 帧延迟以厘秒为单位，按源时长与输出帧数 Bresenham 均摊，
 总时长误差 < 1 厘秒；目标帧率高于 50fps（延迟低于 2 厘秒）时直接
@@ -45,9 +52,12 @@ from vgif.pipeline import (  # noqa: E402
     PipelineError,
     convert_to_gif,
     derive_output_frame_count,
-    derive_target_size,
+    resolve_target_size,
 )
-from vgif.scale import bilinear_resize, nearest_resize_indexed  # noqa: E402
+from vgif.scale import (  # noqa: E402
+    nearest_resize_indexed,
+    resize_rgb,
+)
 from vgif.quantize import QuantizedFrame  # noqa: E402
 from vgif.gif_writer import write_gif  # noqa: E402
 
@@ -59,7 +69,22 @@ def _add_common_quality_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--max-width", type=int, default=DEFAULT_MAX_WIDTH,
-        help="缩放后最大宽度（像素），默认 %(default)s；传 0 表示不缩放",
+        help="缩放后最大宽度（像素），默认 %(default)s；传 0 表示不缩放；"
+             "给出 --width/--height 任一显式维度后本参数失效",
+    )
+    p.add_argument(
+        "--width", type=int, default=None,
+        help="显式目标宽（像素，正整数）；高度按源宽高比自动推导，"
+             "与 --max-width 互斥（显式维度优先）",
+    )
+    p.add_argument(
+        "--height", type=int, default=None,
+        help="显式目标高（像素，正整数）；宽度按源宽高比自动推导",
+    )
+    p.add_argument(
+        "--align-odd", action="store_true",
+        help="把最终宽高各自规整到最近奇数（偶数向下取奇）；宽高比与"
+             "奇数对齐冲突时宽高比优先，只产生 ±1px 偏差，不拉伸画面",
     )
     p.add_argument(
         "--colors", type=int, default=DEFAULT_COLORS,
@@ -67,7 +92,8 @@ def _add_common_quality_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--indexed-scale", action="store_true",
-        help="先量化再在索引域最近邻缩放（像素风素材），默认 RGB 双线性",
+        help="先量化再在索引域最近邻缩放（像素风素材），默认 RGB 域"
+             "缩放（缩小面积平均抗锯齿、放大双线性）",
     )
 
 
@@ -83,6 +109,9 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             work_dir=args.work_dir,
             reuse=not args.no_reuse,
             indexed_scale=args.indexed_scale,
+            width=args.width,
+            height=args.height,
+            align_odd=args.align_odd,
         )
     except (PipelineError, TimingError, ExtractError, QuantizeError,
             GifEncodeError, OSError) as exc:
@@ -127,9 +156,11 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
         )
         n_src = manifest.frame_count
         n_out = derive_output_frame_count(manifest, args.fps)
-        dst_w, dst_h = derive_target_size(
+        dst_w, dst_h = resolve_target_size(
             manifest.width, manifest.height,
-            None if args.max_width == 0 else args.max_width,
+            max_width=None if args.max_width == 0 else args.max_width,
+            width=args.width, height=args.height,
+            align_odd=args.align_odd,
         )
         plan = plan_gif_delays(manifest.duration, n_out, args.fps)
         indices = frame_pick_indices(n_src, n_out)
@@ -150,8 +181,9 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
                 for q in qframes
             ]
         else:
+            # 缩放严格在量化前：调色板基于最终尺寸生成。
             scaled = [
-                bilinear_resize(
+                resize_rgb(
                     f, manifest.width, manifest.height, dst_w, dst_h
                 )
                 for f in picked
@@ -168,8 +200,8 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
         }
         with open(args.output, "wb") as fh:
             pickle.dump(payload, fh)
-    except (TimingError, QuantizeError, ExtractError, OSError,
-            KeyError, FileNotFoundError) as exc:
+    except (PipelineError, TimingError, QuantizeError, ExtractError,
+            OSError, KeyError, FileNotFoundError) as exc:
         print(f"量化失败：{exc}", file=sys.stderr)
         return 1
     print(

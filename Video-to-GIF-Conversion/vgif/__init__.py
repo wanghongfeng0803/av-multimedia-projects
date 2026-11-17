@@ -32,7 +32,13 @@ from .quantize import (
     map_frame_to_index,
     quantize_frames,
 )
-from .scale import bilinear_resize, nearest_resize_indexed
+from .scale import (
+    bilinear_resize,
+    area_resize,
+    resize_rgb,
+    nearest_resize_indexed,
+    round_odd,
+)
 from .sampling import sample_frames, sample_indexed_frames
 from .gif_writer import GifEncodeError, write_gif
 from .pipeline import (
@@ -41,6 +47,7 @@ from .pipeline import (
     DEFAULT_COLORS,
     ConversionResult,
     convert_to_gif,
+    resolve_target_size,
 )
 
 __all__ = [
@@ -61,7 +68,10 @@ __all__ = [
     "quantize_frames",
     # scale
     "bilinear_resize",
+    "area_resize",
+    "resize_rgb",
     "nearest_resize_indexed",
+    "round_odd",
     # sampling
     "sample_frames",
     "sample_indexed_frames",
@@ -74,4 +84,5 @@ __all__ = [
     "DEFAULT_COLORS",
     "ConversionResult",
     "convert_to_gif",
+    "resolve_target_size",
 ]

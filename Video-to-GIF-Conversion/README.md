@@ -1,15 +1,55 @@
 # Video-to-GIF-Conversion（vgif）
 
 零三方依赖的视频转 GIF 工具：ffmpeg 只负责解码，调色板量化、帧率采样、
-LZW 压缩与 GIF 封装全部用 Python 标准库从零实现。核心目标是**固定帧率
-转换时的时序零漂移**与**抽帧 / 量化 / 编码三步严格解耦**。
+缩放抗锯齿、LZW 压缩与 GIF 封装全部用 Python 标准库从零实现。核心目标是
+**固定帧率转换时的时序零漂移**与**抽帧 / 量化 / 编码三步严格解耦**。
 
 ## 设计约束（本项目要解决的问题）
 
 1. **体积与画质权衡，默认参数写清依据**（见下文「默认参数」）；
 2. **帧延迟精确对应原帧率**，不能因调色板生成或帧率换算出现快慢漂移；
 3. **抽帧、量化、编码严格分三步解耦**，抽帧 / 量化产物可被后续缩放与
-   采样复用，改目标参数不必重新解码源视频。
+   采样复用，改目标参数不必重新解码源视频；
+4. **缩放的三个目标——保持宽高比、奇数尺寸对齐、不出锯齿——按明确
+   优先级取舍**（见下文「缩放设计」）。
+
+## 缩放设计（宽高比 / 奇数对齐 / 抗锯齿的取舍）
+
+阶段顺序是硬约束：**缩放严格接在抽帧之后、量化之前**。若先量化再缩放，
+调色板会基于错误尺寸的像素生成，因此 RGB 主路径永远是
+`抽帧 → 采样 → 缩放 → 量化 → 编码`，三阶段接口解耦且顺序固定；只有
+像素风素材的 `--indexed-scale` 复用路径在量化后做索引域最近邻（不重新
+量化、零颜色损失）。
+
+### 1. 宽高比与奇数尺寸对齐冲突时：宽高比优先，对齐其次
+
+GIF 格式本身没有偶数尺寸约束（与 H.264 不同），所以**默认不做任何奇偶
+改动**，完全保留旧的 `--max-width` 行为。需要奇数尺寸时显式加
+`--align-odd`，规则为：
+
+1. 先按源宽高比把宽、高等比推导并四舍五入成整数（比例误差只来自取整）；
+2. 再把宽、高**各自**规整到最近的奇数：偶数与相邻两个奇数等距，统一
+   **向下取奇**（如 480×270 → 479×269），规则确定、无随机方向；
+3. 规整只改 ±1px，**不回头重算另一维、绝不拉伸画面**。
+
+即冲突时接受 ≤1px 的比例偏差来满足奇数对齐，而不是破坏宽高比去凑奇数。
+显式 `--width`/`--height` 只做等比缩放：只给一个维度时另一个自动推导；
+两个维度同时给出且与源宽高比不一致（容差 1px）时**直接报错**，要求
+调用方在裁剪与变形之间自行抉择，工具不静默拉伸。
+
+### 2. 缩放算法按方向选择，避免锯齿
+
+| 方向 | 算法 | 依据 |
+| --- | --- | --- |
+| 缩小（dst < src） | 面积平均（box filter） | 每个输出像素覆盖源图一个矩形区域，区域内**全部**像素按覆盖面积加权平均，等价于先低通再重采样；高频细节被平均掉而非硬丢弃，无摩尔纹/锯齿 |
+| 放大（dst ≥ src） | 双线性插值 | 放大不存在欠采样，2×2 邻域加权即可平滑；1/65536 定点、角点对齐，恒等尺寸逐字节不变 |
+
+双线性缩小只触碰每个输出点附近的 2×2 邻域，落在采样点之间的高频细节会
+被直接丢弃（实测 9px 明暗细条 3:1 缩小，双线性产出 `0/255` 硬极端值，
+面积平均产出 `170/85/170` 中间调，能量被保留）。统一入口 `resize_rgb`
+逐轴独立选路，「宽缩小、高放大」这类混合情形按轴级联（先面积后双线性），
+全程纯整数定点、跨平台逐字节可复现。面积平均按每个输出像素的**实际权重
+总和**归一化（而非固定位移），因此纯色在任意非整数缩放比下都逐值不变。
 
 ## 时序零漂移是怎么做到的
 
@@ -38,7 +78,7 @@ GIF 每帧延迟写在图形控制扩展（GCE）里，单位是**厘秒（1/100
 | 阶段 | 模块 | 职责 | 产物 |
 | --- | --- | --- | --- |
 | 抽帧 | `vgif/extract.py` | ffprobe 探测逐帧 PTS/时长；ffmpeg `-fps_mode passthrough` 逐帧 1:1 解码为 rgb24 | `frame_XXXXXX.rgb` + `manifest.json` |
-| 量化 | `vgif/sampling.py` `scale.py` `quantize.py` | 端点锚定取帧 → RGB 双线性缩放 → 中位切分全局调色板 → 最近邻索引映射 | 调色板 + 索引帧（可 pickle） |
+| 量化 | `vgif/sampling.py` `scale.py` `quantize.py` | 端点锚定取帧 → **缩放（缩小面积平均抗锯齿 / 放大双线性，量化前完成）** → 中位切分全局调色板 → 最近邻索引映射 | 调色板 + 索引帧（可 pickle） |
 | 编码 | `vgif/gif_writer.py` | 纯 Python LZW + GIF89a 封装，厘秒延迟原样写入 | `.gif` |
 
 抽帧产物与帧率 / 调色板无关，换 `--fps`、`--max-width`、`--colors`
@@ -50,7 +90,9 @@ GIF 每帧延迟写在图形控制扩展（GCE）里，单位是**厘秒（1/100
 | 参数 | 默认 | 依据 |
 | --- | --- | --- |
 | `--fps` | `12` | 100/12 经厘秒均摊为 8/9 厘秒交替，节奏均匀且在浏览器安全区；对 24/25/30fps 源为整数级丢帧。体积约为 15fps 的八成、25fps 直转的一半 |
-| `--max-width` | `480` | GIF 仅 256 色且 LZW 压缩率有限，480px 是社媒贴图常用上限；再宽体积近似按像素平方增长，而画质受 256 色上限制约，收益递减 |
+| `--max-width` | `480` | GIF 仅 256 色且 LZW 压缩率有限，480px 是社媒贴图常用上限；再宽体积近似按像素平方增长，而画质受 256 色上限制约，收益递减。旧参数保持可用，语义不变 |
+| `--width` / `--height` | 无 | 显式目标维度（正整数），给出后 `--max-width` 失效；只给一个时另一个按源宽高比推导，两个都给且比例不符直接报错，不拉伸；支持放大 |
+| `--align-odd` | 关闭 | 开启后宽高各自规整到最近奇数（偶数向下取奇）；GIF 本身无奇偶约束，故默认关闭以保留旧行为。宽高比与对齐冲突时宽高比优先，偏差 ≤1px |
 | `--colors` | `256` | 用满全局颜色表换取最好量化质量；需要压体积时降到 128/64（实测同素材 256→64 色体积约降三分之一） |
 
 实测体积（320×240 / 2s testsrc2）：256色12fps 222KB，128色 182KB，
@@ -62,8 +104,19 @@ GIF 每帧延迟写在图形控制扩展（GCE）里，单位是**厘秒（1/100
 
 ```bash
 python gif_convert.py 输入.mp4 输出.gif \
-    [--fps 12] [--max-width 480] [--colors 256] \
-    [--work-dir DIR] [--no-reuse] [--indexed-scale]
+    [--fps 12] [--max-width 480] [--width W --height H] [--align-odd] \
+    [--colors 256] [--work-dir DIR] [--no-reuse] [--indexed-scale]
+```
+
+尺寸参数三种用法（互斥优先级：显式维度 > 最大宽度 > 不缩放）：
+
+```bash
+# 1) 旧用法：限制最大宽，高等比推导（默认，行为与历史版本一致）
+python gif_convert.py in.mp4 a.gif --max-width 480
+# 2) 显式宽（高等比推导），并要求宽高均为奇数：480x270 → 479x269
+python gif_convert.py in.mp4 b.gif --max-width 0 --width 480 --align-odd
+# 3) 只给目标高，宽自动推导；支持放大
+python gif_convert.py in.mp4 c.gif --max-width 0 --height 360
 ```
 
 分步执行（每步产物独立可复用）：
@@ -77,11 +130,17 @@ python gif_convert.py encode   索引产物.pkl 输出.gif
 Python API：
 
 ```python
-from vgif import convert_to_gif
+from vgif import convert_to_gif, resolve_target_size
+
+# 先解析尺寸，确认宽高比/奇数对齐的取舍结果
+w, h = resolve_target_size(1920, 1080, max_width=480, align_odd=True)
+assert (w, h) == (479, 269)
+
 result = convert_to_gif("in.mp4", "out.gif",
                         target_fps=12, max_width=480, colors=256,
+                        width=None, height=None, align_odd=False,
                         work_dir="./vgif_work")  # 给出目录即可跨调用复用
-print(result.gif_duration, result.duration_error, result.delays_cs)
+print(result.width, result.height, result.delays_cs)
 ```
 
 ## 工程约定
@@ -92,7 +151,9 @@ print(result.gif_duration, result.duration_error, result.delays_cs)
   `__init__.py` 重新导出。
 - 纯逻辑测试不依赖 ffmpeg；集成测试在无 ffmpeg 时自动 skip。
 - 定点缩放（1/65536）与 Bresenham 取帧均为纯整数运算，结果确定性、
-  跨平台可复现。
+  跨平台可复现；面积平均按实际权重总和整数归一化，纯色任意比例不变。
+- 旧尺寸参数（`--max-width`、`max_width=`）保持可用且默认行为逐字节
+  不变，新能力（显式宽高、奇数对齐、面积抗锯齿）全部为 opt-in。
 
 ## 测试
 
@@ -100,16 +161,19 @@ print(result.gif_duration, result.duration_error, result.delays_cs)
 python -m pytest -q
 ```
 
-95 项测试：时序规划（端点锚定 / 厘秒均摊 / 安全下限）、中位切分量化、
-双线性与索引缩放、LZW 往返（自带独立解码器核对）、GIF 字节结构，以及
-ffmpeg 端到端（时序零漂移、三步复用、CLI、抽帧 1:1）。
+140 项测试：时序规划（端点锚定 / 厘秒均摊 / 安全下限）、中位切分量化、
+缩放（奇数对齐、面积平均抗锯齿与双线性的方向选路、混合轴级联、索引
+最近邻）、LZW 往返（自带独立解码器核对）、GIF 字节结构，以及 ffmpeg
+端到端（时序零漂移、三步复用、CLI、抽帧 1:1、显式尺寸与奇数对齐）。
 
 ## 模块说明
 
 - `vgif/timing.py`：帧下标 Bresenham 映射 + 厘秒延迟规划（零漂移核心）
 - `vgif/extract.py`：ffprobe 探测 + ffmpeg 抽帧（passthrough、stderr 防死锁）
 - `vgif/sampling.py`：RGB / 索引两条同构采样路径
-- `vgif/scale.py`：RGB 双线性（定点）+ 索引域最近邻
+- `vgif/scale.py`：`round_odd` 奇数对齐 + 面积平均（缩小抗锯齿）/
+  双线性（放大）/ `resize_rgb` 逐轴选路 + 索引域最近邻
 - `vgif/quantize.py`：中位切分全局调色板 + 立方缓存最近邻映射
 - `vgif/gif_writer.py`：GIF89a 封装 + LZW 变体编码
-- `vgif/pipeline.py`：三步编排、默认参数、工作目录复用
+- `vgif/pipeline.py`：三步编排、`resolve_target_size` 尺寸取舍、
+  默认参数、工作目录复用

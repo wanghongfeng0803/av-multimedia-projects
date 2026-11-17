@@ -144,6 +144,51 @@ class TestEndToEnd:
         assert out.is_file()
         assert (r.width, r.height) == (32, 24)
 
+    def test_explicit_width_derives_height(self, video_factory, tmp_path):
+        video = video_factory(frames=12, fps=12)  # 默认 64x48（4:3）
+        out = tmp_path / "w.gif"
+        r = convert_to_gif(
+            video, out, target_fps=10, max_width=None, width=32
+        )
+        assert (r.width, r.height) == (32, 24)
+        assert _gif_total_duration(out) > 0
+
+    def test_explicit_height_derives_width(self, video_factory, tmp_path):
+        video = video_factory(frames=12, fps=12)
+        out = tmp_path / "h.gif"
+        r = convert_to_gif(
+            video, out, target_fps=10, max_width=None, height=24
+        )
+        assert (r.width, r.height) == (32, 24)
+
+    def test_align_odd_outputs_odd_dimensions(self, video_factory, tmp_path):
+        video = video_factory(frames=12, fps=12)  # 64x48
+        out = tmp_path / "odd.gif"
+        # 等比到 32x24（均偶数），对齐后应为 31x23。
+        r = convert_to_gif(
+            video, out, target_fps=10, max_width=32, align_odd=True
+        )
+        assert (r.width, r.height) == (31, 23)
+        assert r.width % 2 == 1 and r.height % 2 == 1
+
+    def test_inconsistent_explicit_dims_rejected(self, video_factory,
+                                                 tmp_path):
+        video = video_factory(frames=12, fps=12)
+        with pytest.raises(Exception, match="宽高比"):
+            convert_to_gif(
+                video, tmp_path / "x.gif",
+                target_fps=10, max_width=None, width=32, height=32,
+            )
+
+    def test_upscale_via_explicit_width(self, video_factory, tmp_path):
+        video = video_factory(frames=12, fps=12)  # 64x48
+        out = tmp_path / "up.gif"
+        r = convert_to_gif(
+            video, out, target_fps=10, max_width=None, width=96
+        )
+        assert (r.width, r.height) == (96, 72)
+        assert out.stat().st_size > 0
+
     def test_vfr_passthrough_no_frame_invention(self, tmp_path):
         """非整数帧率素材：抽帧数必须等于 ffprobe 实解帧数。"""
         video = tmp_path / "vfr.mp4"
@@ -189,6 +234,33 @@ class TestCli:
         assert main(["encode", str(payload), str(out)]) == 0
         assert out.is_file()
         assert abs(_gif_total_duration(out) - 1.0) < 0.01
+
+    def test_cli_explicit_width_and_align_odd(self, video_factory, tmp_path):
+        from gif_convert import main
+
+        video = video_factory(frames=16, fps=16)  # 64x48
+        out = tmp_path / "cli_odd.gif"
+        rc = main([
+            str(video), str(out), "--fps", "8",
+            "--max-width", "0", "--width", "32", "--align-odd",
+        ])
+        assert rc == 0
+        assert out.is_file()
+        # 32x24 对齐奇数 → 31x23。
+        from .test_gif_writer import parse_gif
+        w, h, _, frames = parse_gif(out)
+        assert (w, h) == (31, 23)
+        assert len(frames) == 8
+
+    def test_cli_bad_aspect_returns_error(self, video_factory, tmp_path):
+        from gif_convert import main
+
+        video = video_factory(frames=12, fps=12)
+        rc = main([
+            str(video), str(tmp_path / "bad.gif"),
+            "--max-width", "0", "--width", "32", "--height", "40",
+        ])
+        assert rc == 1
 
     def test_missing_input_returns_error(self, tmp_path):
         from gif_convert import main
