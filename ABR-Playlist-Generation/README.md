@@ -1,10 +1,13 @@
 # ABR-Playlist-Generation（vhls）
 
-零三方依赖的单码率 HLS 打包器：ffmpeg 只负责重编码切片，时间轴规划、
-m3u8 渲染与全部时序校验都用 Python 标准库实现。核心目标是**切片与播放
-列表共用同一套时间轴，EXTINF 与分片真实时长严格一致，无累积漂移**。
+零三方依赖的 HLS 打包器：ffmpeg 只负责重编码切片，时间轴规划、
+m3u8 渲染与全部时序校验都用 Python 标准库实现。支持**单码率**与
+**多码率（ABR）**两种模式，核心目标是**切片与播放列表共用同一套
+时间轴，EXTINF 与分片真实时长严格一致，主列表标注可独立核对**。
 
 ## 设计约束（本项目要解决的问题）
+
+单码率：
 
 1. **分片时长必须与 EXTINF 声明一致**（含浮点舍入），实测偏差超容差
    整体失败，不产出对不上的列表；
@@ -14,6 +17,18 @@ m3u8 渲染与全部时序校验都用 Python 标准库实现。核心目标是*
 4. **末片不足目标时长时单独标出且时长准确**，EXTINF 如实写真实长度，
    绝不补齐成目标时长；
 5. **列表写入与切片切割共用同一套时间轴**，从结构上消除累积误差漂移。
+
+多码率（ABR）：
+
+6. **主列表 BANDWIDTH/RESOLUTION 与各子流真实值一致**——BANDWIDTH
+   取该路所有分片「文件字节数 × 8 ÷ 实测时长」的峰值（RFC 8216 峰值
+   分片码率口径），RESOLUTION 取分片视频流的 ffprobe 实测宽高，两者
+   都可用磁盘上的分片独立重算核对，不是请求值；
+7. **各子列表分片对齐一致**——所有码率共享同一份时间轴计划，切点/
+   片数/序列号由构造保证一致，不同码率之间不能多片/少片；切割完成后
+   逐片复核各码率实测时长，偏差超容差即整体失败；
+8. **旧单码率输出保持兼容**——`pack_hls` 与 `hls_pack.py` 行为不变，
+   ABR 是独立的 `pack_abr` / `abr_pack.py` 入口。
 
 ## 一套时间轴是怎么做到零漂移的
 
@@ -77,7 +92,51 @@ seg_00002.ts
 - 每个分片可被 ffmpeg 独立解码（片首 IDR），按 m3u8 反向 remux 回
   单个文件时长与源一致。
 
-## 用法
+## 多码率（ABR）模式
+
+`pack_abr` / `abr_pack.py` 在单码率四步之上加一层编排：
+
+```
+输出目录/
+  master.m3u8          # 主列表（EXT-X-STREAM-INF 指向各子列表）
+  180p/index.m3u8      # 每路码率一个子目录 + 子列表
+  180p/seg_00000.ts
+  360p/index.m3u8
+  360p/seg_00000.ts
+```
+
+- **共享时间轴**：所有码率共用同一份 `TimelinePlan`，切点/片数/序列号
+  完全一致——「不同码率不能多片/少片」由构造保证，不靠事后对齐。
+- **标注可独立核对**：主列表的 `BANDWIDTH` 是该路分片的峰值码率
+  （`max(文件字节数 × 8 ÷ 实测时长)`），`RESOLUTION` 是分片视频流的
+  ffprobe 实测宽高。任何核对者用磁盘上的分片即可重算，不依赖本项目
+  的内部状态。源小于目标分辨率时不放大，RESOLUTION 如实写源分辨率。
+- **跨码率对齐复核**：切割完成后逐片比对各码率实测时长，偏差超容差
+  （默认 2×20ms）即整体失败，不写主列表。
+
+```bash
+python abr_pack.py 输入视频 输出目录 [--target 6] [--tolerance 20] \
+                    [--ladder 360p:400k,480p:800k,720p:2500k]
+```
+
+- `--ladder`：码率阶梯，格式 `<名称>:<码率>`，逗号分隔；缺省按源高度
+  自动生成（360p/480p/720p/1080p 中不超过源高度的档位，源更矮时回退
+  到源分辨率单档）。
+
+作为库调用：
+
+```python
+from vhls import pack_abr, Rendition
+
+result = pack_abr("in.mp4", "out_abr", renditions=(
+    Rendition(name="360p", height=360, video_bitrate=400_000),
+    Rendition(name="720p", height=720, video_bitrate=2_500_000),
+))
+for v in result.variants:
+    print(v.rendition.name, v.bandwidth, f"{v.width}x{v.height}")
+```
+
+## 用法（单码率）
 
 ```bash
 python hls_pack.py 输入视频 输出目录 [--target 6] [--playlist index.m3u8] \
@@ -107,5 +166,11 @@ python -m pytest tests/ -q
 - `test_timeline.py` / `test_playlist.py`：纯逻辑，不依赖 ffmpeg，
   覆盖帧边界分组、VFR、整数毫秒无漂移、量化误差边界、EXTINF 舍入、
   TARGETDURATION 对齐、序列号连续性、短尾标记与原子写入；
-- `test_integration_pack.py`：真实 ffmpeg 端到端，独立解析 m3u8 并对
-  每片单独 ffprobe 交叉验证（环境缺 ffmpeg/ffprobe 时自动 skip）。
+- `test_abr.py`：ABR 纯逻辑，覆盖默认阶梯、主列表渲染、峰值码率
+  计算、跨码率对齐复核的接受/拒绝路径；
+- `test_integration_pack.py`：单码率真实 ffmpeg 端到端，独立解析
+  m3u8 并对每片单独 ffprobe 交叉验证（环境缺 ffmpeg/ffprobe 时自动
+  skip）；
+- `test_integration_abr.py`：ABR 真实 ffmpeg 端到端，独立解析
+  master.m3u8 的 BANDWIDTH/RESOLUTION 并对每片单独 ffprobe 重算核对，
+  验证各路码率分片数与 EXTINF 逐片对齐。

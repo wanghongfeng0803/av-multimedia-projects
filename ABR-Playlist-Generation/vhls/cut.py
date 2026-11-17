@@ -33,9 +33,11 @@ from .timeline import (
 
 __all__ = [
     "CutError",
+    "EncodeProfile",
     "SegmentResult",
     "cut_segments",
     "probe_segment_duration_ms",
+    "probe_segment_geometry",
     "DEFAULT_DURATION_TOLERANCE_MS",
 ]
 
@@ -49,6 +51,23 @@ DEFAULT_DURATION_TOLERANCE_MS = 20
 
 class CutError(RuntimeError):
     """ffmpeg 切割失败、产物缺失或实测时长与计划不一致。"""
+
+
+@dataclass(frozen=True)
+class EncodeProfile:
+    """单路码率的编码参数（ABR 用；缺省即旧单码率行为，完全不缩放不限速）。
+
+    :ivar width: 目标宽度（像素），None 表示保持源宽度。
+    :ivar height: 目标高度（像素），None 表示保持源高度。
+    :ivar video_bitrate: 目标视频码率（bps，整数），None 表示不限速
+        （旧单码率行为：只给 preset，不给 -b:v）。
+    :ivar audio_bitrate: 音频码率（bps，整数），默认 128k 与旧行为一致。
+    """
+
+    width: int | None = None
+    height: int | None = None
+    video_bitrate: int | None = None
+    audio_bitrate: int = 128_000
 
 
 @dataclass(frozen=True)
@@ -102,9 +121,35 @@ def probe_segment_duration_ms(path: Path) -> int:
     return int(raw * MS_PER_SEC + 0.5)
 
 
+def probe_segment_geometry(path: Path) -> tuple:
+    """用 ffprobe 实测分片视频流分辨率，返回 ``(width, height)``。
+
+    ABR 主列表的 RESOLUTION 标注必须与子流真实分辨率一致，因此以编码
+    产物的实测值为准，而不是请求值（源小于目标分辨率时不放大，实测值
+    就与请求值不同）。分片无视频流时直接报错，不允许猜测。
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type,width,height",
+        "-of", "json", str(path),
+    ]
+    data = json.loads(run_capture(cmd).stdout.decode("utf-8"))
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            return int(stream["width"]), int(stream["height"])
+    raise CutError(f"ffprobe 未发现分片视频流：{path}")
+
+
 def _build_ffmpeg_cmd(source: SourceInfo, spec: SegmentSpec,
-                      out_path: Path) -> list:
-    """构造单片重编码命令（帧精确切割 + 片首强制 IDR）。"""
+                      out_path: Path,
+                      profile: EncodeProfile | None = None) -> list:
+    """构造单片重编码命令（帧精确切割 + 片首强制 IDR）。
+
+    ``profile`` 为 None 或全缺省时与旧单码率行为逐字节一致：不缩放、
+    不限速、音频 128k。给出缩放/码率时追加 ``scale`` 滤镜与
+    ``-b:v/-maxrate/-bufsize``（maxrate=1.2×、bufsize=2×目标码率，
+    常规 ABR 峰值约束口径）。
+    """
     start = _seconds_text(spec.start_ms)
     length = _seconds_text(spec.planned_duration_ms)
     cmd = [
@@ -113,14 +158,28 @@ def _build_ffmpeg_cmd(source: SourceInfo, spec: SegmentSpec,
         "-i", str(source.path),
         "-t", length,                  # 单片时长，由计划毫秒换算，不累积
         "-map", "0:v:0",
+    ]
+    if profile is not None and (profile.width or profile.height):
+        w = profile.width if profile.width else -2
+        h = profile.height if profile.height else -2
+        cmd += ["-vf", f"scale={w}:{h}"]
+    cmd += [
         "-force_key_frames", "0",      # 片首强制 IDR，每片可独立起播
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
     ]
+    if profile is not None and profile.video_bitrate:
+        vbr = profile.video_bitrate
+        cmd += [
+            "-b:v", str(vbr),
+            "-maxrate", str(int(vbr * 6 // 5)),
+            "-bufsize", str(int(vbr * 2)),
+        ]
     if source.has_audio:
         # AAC 帧约 23ms 粒度，-t 在音频侧按帧对齐，偏差由实测容差兜底。
-        cmd += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"]
+        abr = profile.audio_bitrate if profile is not None else 128_000
+        cmd += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", str(abr)]
     cmd += ["-f", "mpegts", str(out_path)]
     return cmd
 
@@ -130,6 +189,7 @@ def cut_segments(
     plan: TimelinePlan,
     output_dir: str | Path,
     tolerance_ms: int = DEFAULT_DURATION_TOLERANCE_MS,
+    profile: EncodeProfile | None = None,
 ) -> tuple:
     """按计划逐片切割并实测时长，返回与计划一一对应的切割结果。
 
@@ -137,6 +197,7 @@ def cut_segments(
     已产出的分片保留在输出目录（便于排查），但上层不应写播放列表。
 
     :param tolerance_ms: 实测与计划时长的最大允许偏差（毫秒）。
+    :param profile: 编码参数（缩放/码率）；None 时与旧单码率行为一致。
     :return: :class:`SegmentResult` 元组，顺序与 ``plan.segments`` 一致。
     """
     check_tools()
@@ -148,7 +209,7 @@ def cut_segments(
     results: list = []
     for spec in plan.segments:
         out_path = output_dir / spec.filename
-        cmd = _build_ffmpeg_cmd(source, spec, out_path)
+        cmd = _build_ffmpeg_cmd(source, spec, out_path, profile)
         try:
             run_capture(cmd)
         except ProbeError as exc:
