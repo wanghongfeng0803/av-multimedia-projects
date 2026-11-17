@@ -1,4 +1,4 @@
-"""运动检测核心：分块帧差 + 局部自适应阈值 + 光照突变抑制。
+"""运动检测核心（帧差模式）：分块帧差 + 局部自适应阈值 + 光照突变抑制。
 
 设计针对的核心矛盾是「光照突变要抑制，但不能用简单全局归一化一棒子
 打死」。直接对整帧做亮度归一化（如减去全局均值差）会把车灯扫过、
@@ -19,6 +19,10 @@
    抑制期内再次突变则重新计时。参考帧在抑制期仍逐帧滚动（否则旧参考
    会让 holdoff 无限重触发），冻结的只是检测输出，避免突变后连锁误报。
 
+本模式的参考是**上一帧整体滚动**；与背景建模模式
+（:mod:`vmotion.background`，参考为逐块选择性更新的运行背景）共享
+门控/形态学/滞后机制，公共实现见 :mod:`vmotion.detection_common`。
+
 输出侧再经形态学开闭、连通域与面积/滞后过滤，最终只产出二值掩码与
 :class:`~vmotion.morphology.Region` 列表——检测模块不做任何可视化与
 落盘，标记/事件模块只消费这里的数据结构。
@@ -26,10 +30,13 @@
 
 from dataclasses import asdict, dataclass, field
 
-from .morphology import (
-    close_mask,
-    connected_components,
-    open_mask,
+from .detection_common import (
+    GateConfig,
+    Hysteresis,
+    block_means,
+    gate_block_mask,
+    refine_mask,
+    upsample_block_mask,
 )
 
 __all__ = [
@@ -41,8 +48,8 @@ __all__ = [
 
 
 @dataclass
-class MotionConfig:
-    """检测参数（全部可配，阈值类参数均给保守默认值）。
+class MotionConfig(GateConfig):
+    """帧差模式检测参数（全部可配，阈值类参数均给保守默认值）。
 
     参数
     ----
@@ -70,34 +77,12 @@ class MotionConfig:
         突变后强制抑制的帧数；期间再次出现突变则重新计时。
     """
 
-    block: int = 8
-    local_radius: int = 3
-    pixel_threshold: float = 12.0
-    gain: float = 3.0
-    min_area: int = 64
-    open_radius: int = 1
-    close_radius: int = 1
-    trigger_frames: int = 2
-    release_frames: int = 3
     illum_change_threshold: float = 25.0
     illum_hold_frames: int = 2
 
     def validate(self):
         """参数合法性检查，非法时抛 :class:`ValueError`（不静默夹取）。"""
-        if self.block <= 0:
-            raise ValueError("block 必须为正整数")
-        if self.local_radius < 0:
-            raise ValueError("local_radius 不能为负")
-        if self.pixel_threshold < 0 or self.pixel_threshold > 255:
-            raise ValueError("pixel_threshold 须落在 [0, 255]")
-        if self.gain < 0:
-            raise ValueError("gain 不能为负")
-        if self.min_area <= 0:
-            raise ValueError("min_area 必须为正")
-        if self.open_radius < 0 or self.close_radius < 0:
-            raise ValueError("形态学半径不能为负")
-        if self.trigger_frames <= 0 or self.release_frames <= 0:
-            raise ValueError("trigger_frames / release_frames 必须为正")
+        self.validate_common()
         if not (0 <= self.illum_change_threshold <= 255):
             raise ValueError("illum_change_threshold 须落在 [0, 255]")
         if self.illum_hold_frames < 0:
@@ -141,38 +126,8 @@ class FrameDetection:
     stats: dict = field(default_factory=dict)
 
 
-def _integral_image(values, cols, rows):
-    """一维紧凑值数组的积分图（uint64 口径，Python int 无溢出风险）。
-
-    返回长度 (cols+1)*(rows+1) 的列表，``I[r,c]`` 为左上 (0,0) 到
-    (r-1,c-1) 的矩形和；首行首列恒 0，窗和可 O(1) 取得。
-    """
-    stride = cols + 1
-    integ = [0] * (stride * (rows + 1))
-    for r in range(rows):
-        row_sum = 0
-        src_base = r * cols
-        dst_base = (r + 1) * stride
-        prev_base = r * stride
-        for c in range(cols):
-            row_sum += values[src_base + c]
-            integ[dst_base + c + 1] = integ[prev_base + c + 1] + row_sum
-    return integ
-
-
-def _window_sum(integ, cols, rows, r, c, radius):
-    """积分图上取以 (r,c) 为中心、半径 radius 的夹边窗和。"""
-    r0 = max(0, r - radius)
-    r1 = min(rows - 1, r + radius) + 1
-    c0 = max(0, c - radius)
-    c1 = min(cols - 1, c + radius) + 1
-    stride = cols + 1
-    return (integ[r1 * stride + c1] - integ[r0 * stride + c1]
-            - integ[r1 * stride + c0] + integ[r0 * stride + c0])
-
-
 class MotionDetector:
-    """逐帧运动检测器，持有参考帧与滞后/光照抑制状态。
+    """逐帧运动检测器（帧差模式），持有参考帧与滞后/光照抑制状态。
 
     用法::
 
@@ -196,126 +151,47 @@ class MotionDetector:
         self._bcols = (self.width + self.config.block - 1) // self.config.block
         self._brows = (self.height + self.config.block - 1) // self.config.block
         # 滞后状态机
-        self._hit_run = 0
-        self._miss_run = 0
-        self._motion = False
+        self._hyst = Hysteresis(self.config.trigger_frames,
+                                self.config.release_frames)
         # 光照抑制：剩余抑制帧数；>0 表示当前处于 holdoff
         self._hold_remaining = 0
 
+    # 旧版本把去抖计数直接挂在检测器上，保留只读别名供既有测试/调试使用
+    @property
+    def _motion(self):
+        return self._hyst.motion
+
+    @property
+    def _hit_run(self):
+        return self._hyst.hit_run
+
+    @property
+    def _miss_run(self):
+        return self._hyst.miss_run
+
     # ------------------------------------------------------------ 内部
     def _block_means(self, plane):
-        """灰度平面 → 块均值平面（float 列表，长度 bcols*brows）。
-
-        两遍 O(WH) 实现，每个像素只访问一次：
-
-        1. 逐行把像素累加到所在块列的行累加器（``row_sum[bx]``）；
-        2. 每经过一个块的底行，把该块各行的累加器求和并除以块面积。
-
-        边缘不满块按实际像素数归一，结果与嵌套窗口求和逐值一致。
-        """
-        b = self.config.block
-        means = [0.0] * (self._bcols * self._brows)
-        row_sum = [0] * self._bcols
-        for y in range(self.height):
-            row_base = y * self.width
-            bx = 0
-            x = 0
-            while x < self.width:
-                x1 = min(self.width, x + b)
-                row_sum[bx] += sum(plane[row_base + x:row_base + x1])
-                bx += 1
-                x = x1
-            last_row_of_block = (y % b == b - 1) or (y == self.height - 1)
-            if last_row_of_block:
-                by = y // b
-                y0 = by * b
-                block_h = y - y0 + 1
-                for c in range(self._bcols):
-                    x0 = c * b
-                    block_w = min(b, self.width - x0)
-                    means[by * self._bcols + c] = (
-                        row_sum[c] / (block_h * block_w)
-                    )
-                row_sum = [0] * self._bcols
-        return means
+        """灰度平面 → 块均值平面（转发共享实现）。"""
+        return block_means(plane, self.width, self.height,
+                           self.config.block, self._bcols, self._brows)
 
     def _global_mean(self, plane):
         """整帧灰度均值（O(WH) 一次求和）。"""
         return sum(plane) / (self.width * self.height)
 
     def _gate_mask(self, cur_means, ref_means):
-        """块级差分 + 局部 MAD 门控，返回 (全分辨率掩码, 统计 dict)。"""
+        """块级差分 + 局部 MAD 门控 + 上采样，返回 (全分辨率掩码, 统计)。"""
         cfg = self.config
-        diffs = [abs(a - b) for a, b in zip(cur_means, ref_means)]
-        # 局部 MAD：差分块平面的积分图 → 邻窗均值（O(块数)）
-        integ = _integral_image(diffs, self._bcols, self._brows)
-        local_mad = [0.0] * len(diffs)
-        for by in range(self._brows):
-            for bx in range(self._bcols):
-                r0 = max(0, by - cfg.local_radius)
-                r1 = min(self._brows - 1, by + cfg.local_radius) + 1
-                c0 = max(0, bx - cfg.local_radius)
-                c1 = min(self._bcols - 1, bx + cfg.local_radius) + 1
-                win = (r1 - r0) * (c1 - c0)
-                local_mad[by * self._bcols + bx] = (
-                    _window_sum(integ, self._bcols, self._brows,
-                                by, bx, cfg.local_radius) / win
-                )
-
-        raw_pixels = 0
-        gated_pixels = 0
-        block_hit = bytearray(self._bcols * self._brows)
-        for idx, d in enumerate(diffs):
-            threshold = max(cfg.pixel_threshold,
-                            cfg.gain * local_mad[idx])
-            if d > cfg.pixel_threshold:
-                raw_pixels += 1
-            if d > threshold:
-                block_hit[idx] = 1
-                gated_pixels += 1
-
-        # 块掩码上采样到全分辨率（边缘块夹到画面尺寸），整段切片填充
-        mask = bytearray(self.width * self.height)
-        b = cfg.block
-        for by in range(self._brows):
-            y0 = by * b
-            y1 = min(self.height, y0 + b)
-            for bx in range(self._bcols):
-                if not block_hit[by * self._bcols + bx]:
-                    continue
-                x0 = bx * b
-                x1 = min(self.width, x0 + b)
-                strip = b"\x01" * (x1 - x0)
-                for y in range(y0, y1):
-                    row_base = y * self.width
-                    mask[row_base + x0:row_base + x1] = strip
-
-        stats = {
-            "raw_pixels": raw_pixels,
-            "gated_pixels": gated_pixels,
-            "mad": round(sum(diffs) / len(diffs), 4),
-            "local_mad": round(sum(local_mad) / len(local_mad), 4),
-        }
+        block_hit, stats = gate_block_mask(
+            cur_means, ref_means, self._bcols, self._brows, cfg)
+        mask = upsample_block_mask(
+            block_hit, self.width, self.height,
+            cfg.block, self._bcols, self._brows)
         return mask, stats
 
     def _refine(self, mask):
-        """形态学清理 + 连通域 + 面积过滤，返回 (掩码, Region 列表)。"""
-        cfg = self.config
-        if cfg.open_radius > 0:
-            mask = open_mask(mask, self.width, self.height, cfg.open_radius)
-        if cfg.close_radius > 0:
-            mask = close_mask(mask, self.width, self.height, cfg.close_radius)
-        labels, regions = connected_components(mask, self.width, self.height)
-        kept = [r for r in regions if r.area >= cfg.min_area]
-        if len(kept) == len(regions):
-            return bytes(mask), kept
-        # 有区域被面积门槛丢弃：按存活标签重建掩码，保持两者严格一致
-        kept_labels = {r.label for r in kept}
-        rebuilt = bytearray(self.width * self.height)
-        for i, tag in enumerate(labels):
-            if tag and tag in kept_labels:
-                rebuilt[i] = 1
-        return bytes(rebuilt), kept
+        """形态学清理 + 连通域 + 面积过滤（转发共享实现）。"""
+        return refine_mask(mask, self.width, self.height, self.config)
 
     # ------------------------------------------------------------ 对外
     def update(self, plane, frame_index, pts_time=None):
@@ -363,9 +239,7 @@ class MotionDetector:
             # 抑制期不出掩码、清空去抖计数；参考帧仍需滚动到当前帧，
             # 否则下一帧相对突变前的旧参考会再次算出跳变，holdoff 被
             # 无限重新触发。冻结的是「检测输出」，不是参考帧本身。
-            self._hit_run = 0
-            self._miss_run = 0
-            self._motion = False
+            self._hyst.reset()
             self._reference = bytes(plane)
             return FrameDetection(
                 frame=frame_index, pts_time=pts, mask=bytes(empty),
@@ -388,19 +262,9 @@ class MotionDetector:
         # 不算命中，保证运动态与对外掩码/区域严格一致，不产生空事件
         refined_mask, regions = self._refine(mask)
         hit = len(regions) > 0
-        if hit:
-            self._hit_run += 1
-            self._miss_run = 0
-        else:
-            self._miss_run += 1
-            self._hit_run = 0
-        # 滞后状态机：连续 trigger 帧命中才置位，连续 release 帧无命中才清位
-        if not self._motion and self._hit_run >= cfg.trigger_frames:
-            self._motion = True
-        elif self._motion and self._miss_run >= cfg.release_frames:
-            self._motion = False
+        self._hyst.update(hit)
 
-        if self._motion and hit:
+        if self._hyst.motion and hit:
             mask, regions = refined_mask, regions
         else:
             # 去抖未确认或迟滞释放中：不对外出掩码，避免事件碎裂
@@ -410,7 +274,7 @@ class MotionDetector:
         self._reference = bytes(plane)
         return FrameDetection(
             frame=frame_index, pts_time=pts, mask=mask,
-            regions=regions, motion=self._motion, stats=stats,
+            regions=regions, motion=self._hyst.motion, stats=stats,
         )
 
     def config_dict(self):

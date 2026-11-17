@@ -9,8 +9,8 @@
 
 - 存活区域画绿色矩形框 + 区域编号，事件编号显示在左上角状态行，
   保证标记视频与事件列表逐帧可对照；
-- 光照抑制帧画黄色 ``HOLDOFF``，空闲帧只保留灰色状态行，三种状态
-  视觉上刻意区分；
+- 背景建模预热帧画黄色 ``WARMUP``、光照抑制帧画黄色 ``HOLDOFF``，
+  空闲帧只保留灰色状态行，四种状态视觉上刻意区分；
 - 文字用 :mod:`vmotion.font` 的内置 5×7 点阵，带深色描边，亮/暗背景
   上都可读。
 """
@@ -99,6 +99,9 @@ def draw_text(frame, width, height, x, y, text, color,
 def _status_line(record):
     """拼左上角状态行文本与颜色。"""
     stats = record.stats
+    if stats.get("warmup"):
+        return (f"F{record.frame} WARMUP "
+                f"BG{stats.get('bg_mean', 0.0):.0f}", COLOR_YELLOW)
     if stats.get("held_off"):
         return (f"F{record.frame} HOLDOFF "
                 f"D{stats.get('mean_delta', 0.0):.1f}", COLOR_YELLOW)

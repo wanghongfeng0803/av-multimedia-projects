@@ -109,12 +109,19 @@ def build_result(frames, events, meta, params):
     total = len(frames)
     motion_frames = sum(1 for f in frames if f.motion)
     held_off = sum(1 for f in frames if f.stats.get("held_off"))
+    # 背景建模模式专有：预热期帧数与发生过块吸收的帧数；帧差模式
+    # 的 stats 不含这两个键，.get 兜底为 0，旧 JSON 读回行为不变。
+    warmup = sum(1 for f in frames if f.stats.get("warmup"))
+    absorbing = sum(1 for f in frames
+                    if f.stats.get("absorbed_blocks", 0) > 0)
     gated_total = sum(f.stats.get("gated_pixels", 0) for f in frames)
     stats = {
         "frames": total,
         "motion_frames": motion_frames,
         "motion_ratio": round(motion_frames / total, 6) if total else 0.0,
         "held_off_frames": held_off,
+        "warmup_frames": warmup,
+        "absorbing_frames": absorbing,
         "events": len(events),
         "gated_blocks_total": gated_total,
         "regions_total": sum(len(f.regions) for f in frames),

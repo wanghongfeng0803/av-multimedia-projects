@@ -2,6 +2,7 @@
 
 import pytest
 
+from vmotion.background import BackgroundConfig
 from vmotion.cli import build_parser, main
 from vmotion.detector import DEFAULT_CONFIG, MotionConfig
 
@@ -23,6 +24,8 @@ def test_detect_defaults_match_config():
         illum_hold_frames=args.illum_hold_frames,
     )
     assert cfg == DEFAULT_CONFIG
+    # 默认仍是帧差模式，旧调用方式行为不变
+    assert args.background is False
 
 
 def test_detect_all_thresholds_override():
@@ -66,4 +69,54 @@ def test_main_mark_missing_json_returns_error(tmp_path):
     rc = main(["mark", str(tmp_path / "in.mp4"),
                str(tmp_path / "missing.json"),
                str(tmp_path / "out.mp4")])
+    assert rc == 1
+
+
+# ----------------------------------------------------- 背景模式与对比命令
+def test_detect_background_flag_maps_to_background_config():
+    from vmotion.cli import _config_from_args
+
+    args = parse(["detect", "in.mp4", "out.json", "--background",
+                  "--warmup-frames", "7", "--learning-rate", "0.1",
+                  "--absorb-frames", "90", "--block", "16"])
+    cfg = _config_from_args(args)
+    assert isinstance(cfg, BackgroundConfig)
+    assert cfg.warmup_frames == 7
+    assert cfg.learning_rate == pytest.approx(0.1)
+    assert cfg.absorb_frames == 90
+    assert cfg.block == 16
+
+
+def test_detect_without_background_flag_maps_to_motion_config():
+    from vmotion.cli import _config_from_args
+
+    args = parse(["detect", "in.mp4", "out.json",
+                  "--warmup-frames", "7"])
+    # 背景专有参数即使被传入，帧差模式也直接忽略
+    cfg = _config_from_args(args)
+    assert isinstance(cfg, MotionConfig)
+    assert not hasattr(cfg, "warmup_frames")
+
+
+def test_compare_parser_exposes_both_param_groups():
+    args = parse(["compare", "in.mp4", "cmp.json",
+                  "--learning-rate", "0.2", "--warmup-frames", "5",
+                  "--gain", "4.0"])
+    assert args.command == "compare"
+    assert args.compare_json == "cmp.json"
+    assert args.learning_rate == pytest.approx(0.2)
+    assert args.warmup_frames == 5
+    assert args.gain == 4.0
+
+
+def test_background_validation_error_returns_exit_1(tmp_path):
+    rc = main(["detect", str(tmp_path / "in.mp4"),
+               str(tmp_path / "o.json"), "--background",
+               "--learning-rate", "0.0"])
+    assert rc == 1
+
+
+def test_compare_missing_input_returns_error(tmp_path):
+    missing = tmp_path / "nope.mp4"
+    rc = main(["compare", str(missing), str(tmp_path / "c.json")])
     assert rc == 1
