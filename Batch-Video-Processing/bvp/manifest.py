@@ -73,6 +73,8 @@ class ManifestEntry:
     ffmpeg_log_path: str | None = None
     #: 输出文件字节数，成功后记录，供复核时与磁盘现状对照
     output_size: int | None = None
+    #: 裁决该任务的规则名（规则引擎接入时写入；旧路径与旧清单为 None）
+    rule_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +88,7 @@ class ManifestEntry:
             "error_type": self.error_type,
             "ffmpeg_log_path": self.ffmpeg_log_path,
             "output_size": self.output_size,
+            "rule_name": self.rule_name,
         }
 
     @classmethod
@@ -101,6 +104,7 @@ class ManifestEntry:
             error_type=data.get("error_type"),
             ffmpeg_log_path=data.get("ffmpeg_log_path"),
             output_size=data.get("output_size"),
+            rule_name=data.get("rule_name"),
         )
 
 
@@ -276,6 +280,7 @@ def make_failure_entry(
     error_type: str,
     *,
     ffmpeg_log_path: str | None = None,
+    rule_name: str | None = None,
 ) -> ManifestEntry:
     """按稳定分类构造失败条目（批量层的统一入口）。"""
     return ManifestEntry(
@@ -287,6 +292,7 @@ def make_failure_entry(
         detail=detail,
         error_type=error_type,
         ffmpeg_log_path=ffmpeg_log_path,
+        rule_name=rule_name,
     )
 
 
@@ -298,6 +304,8 @@ def make_skip_entry(
     reason: SkipReason,
     detail: str,
     error_type: str,
+    *,
+    rule_name: str | None = None,
 ) -> ManifestEntry:
     """按稳定分类构造跳过条目（批量层的统一入口）。"""
     return ManifestEntry(
@@ -309,6 +317,7 @@ def make_skip_entry(
         skip_reason=reason.value,
         detail=detail,
         error_type=error_type,
+        rule_name=rule_name,
     )
 
 
@@ -317,6 +326,8 @@ def make_success_entry(
     input_path: str,
     output_path: str,
     output_size: int,
+    *,
+    rule_name: str | None = None,
 ) -> ManifestEntry:
     """构造成功条目，并记录产物字节数作为复核锚点。"""
     return ManifestEntry(
@@ -325,4 +336,5 @@ def make_success_entry(
         status=STATUS_SUCCESS,
         output_path=output_path,
         output_size=output_size,
+        rule_name=rule_name,
     )

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "defaults": {
+    "crf": 26,
+    "preset": "fast",
+    "jobs": 2,
+    "recursive": true
+  },
+  "rules": [
+    {
+      "name": "hevc-mkv-base",
+      "abstract": true,
+      "params": {
+        "codec": "h265",
+        "container": "mkv",
+        "audio_bitrate": "192k"
+      }
+    },
+    {
+      "name": "archive-mov-hevc",
+      "dir": "./archive",
+      "ext": [".mov", ".mp4"],
+      "inherits": ["hevc-mkv-base"],
+      "params": {
+        "crf": 24
+      }
+    },
+    {
+      "name": "web-h264-high-priority",
+      "priority": 10,
+      "dir": "./archive/web",
+      "inherits": ["hevc-mkv-base"],
+      "params": {
+        "codec": "h264",
+        "container": "mp4",
+        "resolution": "720p"
+      }
+    },
+    {
+      "name": "skip-temp-files",
+      "dir": "./archive",
+      "exclude": ["*.tmp.mp4", "drafts/*"]
+    }
+  ]
+}

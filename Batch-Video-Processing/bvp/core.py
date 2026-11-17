@@ -29,7 +29,13 @@ from .models import MediaInfo, TranscodeResult
 from .probe import probe_media
 from .runner import build_progress_args, run_ffmpeg
 
-__all__ = ["transcode", "supported_codecs", "supported_containers", "ProgressCallback"]
+__all__ = [
+    "transcode",
+    "supported_codecs",
+    "supported_containers",
+    "parse_resolution_spec",
+    "ProgressCallback",
+]
 
 #: 进度回调：0.0-1.0 的完成比例（单调不减）
 ProgressCallback = Callable[[float], None]
@@ -258,23 +264,44 @@ def _video_filter(video, resolution: str | None) -> str:
 
 def _scale_filter(resolution: str, src_w: int, src_h: int) -> str:
     """把分辨率表达式解析为 ffmpeg scale 片段（仅支持少量明确写法）。"""
-    text = resolution.strip().lower()
-    if text.endswith("p") and text[:-1].isdigit():
-        height = int(text[:-1])
-        return f"scale=-2:{height}"
-    if text.endswith("%"):
-        try:
-            ratio = max(float(text[:-1]) / 100.0, 0.01)
-        except ValueError as exc:
-            raise InvalidInputError(f"无法解析分辨率表达式: {resolution}") from exc
+    kind, value = parse_resolution_spec(resolution)
+    if kind == "height":
+        return f"scale=-2:{value}"
+    if kind == "ratio":
+        ratio = max(float(value) / 100.0, 0.01)
         return (
             f"scale=trunc(iw*{ratio:.4f}/2)*2:"
             f"trunc(ih*{ratio:.4f}/2)*2"
         )
+    width, height = value
+    return f"scale={width}:{height}"
+
+
+def parse_resolution_spec(resolution: str) -> tuple[str, object]:
+    """静态解析分辨率表达式，不依赖任何具体文件的属性。
+
+    规则引擎在启动校验时复用本函数，确保配置里的分辨率写法语法成立，
+    而不是等到第一个任务运行到转码阶段才报错。
+
+    :returns: ``("height", 整数高)`` / ``("ratio", 百分比浮点)`` /
+        ``("explicit", (宽, 高))``
+    :raises InvalidInputError: 写法无法识别（与转码期同一异常类型、同一口径）
+    """
+    text = resolution.strip().lower()
+    if text.endswith("p") and text[:-1].isdigit():
+        return "height", int(text[:-1])
+    if text.endswith("%"):
+        try:
+            ratio = float(text[:-1])
+        except ValueError as exc:
+            raise InvalidInputError(
+                f"无法解析分辨率表达式: {resolution}"
+            ) from exc
+        return "ratio", ratio
     if "x" in text:
         w_text, _, h_text = text.partition("x")
         if w_text.isdigit() and h_text.isdigit():
-            return f"scale={int(w_text)}:{int(h_text)}"
+            return "explicit", (int(w_text), int(h_text))
     raise InvalidInputError(
         f"无法解析分辨率表达式: {resolution}（支持 1280x720 / 720p / 50%）"
     )

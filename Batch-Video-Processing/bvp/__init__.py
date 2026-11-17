@@ -64,6 +64,19 @@ from .verify import (
 from .batch import BatchResult, batch_transcode
 from .models import MediaInfo, StreamInfo, TranscodeResult
 from .probe import probe_media
+from .rules import (
+    ConfigStore,
+    MatchSpec,
+    ReloadResult,
+    Resolution,
+    ResolvedParams,
+    RuleConfigError,
+    RuleConfigIssue,
+    RuleDefinition,
+    RuleSet,
+    RuleTraceEntry,
+    load_rule_config,
+)
 
 __all__ = [
     # 主入口
@@ -114,4 +127,16 @@ __all__ = [
     "OutputExistsError",
     "FFmpegRunError",
     "EncoderUnavailableError",
+    # 规则引擎
+    "RuleSet",
+    "RuleDefinition",
+    "MatchSpec",
+    "ResolvedParams",
+    "Resolution",
+    "RuleTraceEntry",
+    "RuleConfigError",
+    "RuleConfigIssue",
+    "ConfigStore",
+    "ReloadResult",
+    "load_rule_config",
 ]

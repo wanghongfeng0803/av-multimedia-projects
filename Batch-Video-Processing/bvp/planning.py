@@ -20,6 +20,7 @@ __all__ = [
     "EXIST_SUFFIX",
     "PlannedJob",
     "plan_outputs",
+    "plan_outputs_per_file",
     "mirror_output_path",
     "default_output_path",
 ]
@@ -41,6 +42,10 @@ class PlannedJob:
     output_path: str          # 启动前规划好的绝对输出路径
     source_root: str | None   # 计算镜像相对路径时使用的输入根
     pre_exists: bool          # 规划时输出是否已存在（skip 策略据此跳过）
+    #: 规则引擎裁决出的该任务专属转码参数；None 表示全批统一参数（旧路径）
+    params: dict | None = None
+    #: 裁决该任务的规则名（写入清单，支撑可解释性）
+    rule_name: str | None = None
 
 
 def plan_outputs(
@@ -52,7 +57,7 @@ def plan_outputs(
     codec: str,
     on_exist: str = EXIST_SKIP,
 ) -> list[PlannedJob]:
-    """把扫描出的输入文件规划成带输出路径的有序任务列表。
+    """把扫描出的输入文件规划成带输出路径的有序任务列表（全批同参数）。
 
     :param input_files: :func:`bvp.scanner.scan_inputs` 产出的有序文件
     :param input_roots: 用户给定的原始输入根（文件或目录），用于镜像目录
@@ -62,17 +67,41 @@ def plan_outputs(
     :param on_exist: 输出已存在策略
     :returns: 与输入同序的 :class:`PlannedJob` 列表
     """
-    if on_exist not in _EXIST_POLICIES:
-        raise ValueError(
-            f"on_exist 必须是 {', '.join(sorted(_EXIST_POLICIES))} 之一，"
-            f"收到 {on_exist!r}。"
-        )
+    return plan_outputs_per_file(
+        input_files,
+        input_roots,
+        resolve=lambda _path: (output_dir, extension, codec, on_exist),
+    )
 
+
+def plan_outputs_per_file(
+    input_files: tuple[str, ...],
+    input_roots: list[str],
+    *,
+    resolve,
+) -> list[PlannedJob]:
+    """逐文件规划输出路径，参数由规则引擎按文件裁决。
+
+    :param resolve: 回调，输入绝对文件路径，返回五元素：
+        ``(output_dir, extension, codec, on_exist, params_dict|None,
+        rule_name|None)``（末两位可省略）。规则引擎接入点，纯函数可在
+        无 ffmpeg 环境完整单测。
+    :returns: 与输入同序的 :class:`PlannedJob` 列表
+    """
     roots = [os.path.abspath(r) for r in input_roots if r]
     used_outputs: set[str] = set()
     jobs: list[PlannedJob] = []
 
     for index, input_path in enumerate(input_files):
+        resolved = resolve(input_path)
+        output_dir, extension, codec, on_exist = resolved[:4]
+        params = resolved[4] if len(resolved) > 4 else None
+        rule_name = resolved[5] if len(resolved) > 5 else None
+        if on_exist not in _EXIST_POLICIES:
+            raise ValueError(
+                f"on_exist 必须是 {', '.join(sorted(_EXIST_POLICIES))} 之一，"
+                f"收到 {on_exist!r}。"
+            )
         source_root = _find_containing_root(input_path, roots)
         if output_dir is None:
             output_path = default_output_path(input_path, codec, extension)
@@ -101,6 +130,8 @@ def plan_outputs(
             output_path=output_path,
             source_root=source_root,
             pre_exists=pre_exists and on_exist == EXIST_SKIP,
+            params=params,
+            rule_name=rule_name,
         ))
 
     return jobs
